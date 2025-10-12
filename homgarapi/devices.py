@@ -1,314 +1,439 @@
+"""Device model definitions for the HomGar API client."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
 import re
-from typing import List
+from typing import Any, ClassVar, Final
 
-STATS_VALUE_REGEX = re.compile(r'^(\d+)\((\d+)/(\d+)/(\d+)\)')
+ParsedStats = tuple[int | None, int | None, int | None, int | None]
 
-
-def _parse_stats_value(s):
-    if match := STATS_VALUE_REGEX.fullmatch(s):
-        return int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
-    else:
-        return None, None, None, None
+STATS_VALUE_REGEX: Final[re.Pattern[str]] = re.compile(r"^(\d+)\((\d+)/(\d+)/(\d+)\)")
 
 
-def _temp_to_mk(f):
-    return round(1000 * ((int(f) * .1 - 32) * 5 / 9 + 273.15))
+def _parse_stats_value(value: str) -> ParsedStats:
+    """Parse a stats string of the format 'value(max/min/trend)'."""
+    match = STATS_VALUE_REGEX.fullmatch(value)
+    if match:
+        return (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+            int(match.group(4)),
+        )
+    return (None, None, None, None)
+
+
+def _temp_to_mk(raw_fahrenheit_tenths: str | int) -> int:
+    """Convert tenths of degrees Fahrenheit to millikelvin."""
+    raw_value = int(raw_fahrenheit_tenths)
+    celsius = (raw_value * 0.1 - 32.0) * 5 / 9
+    return round((celsius + 273.15) * 1000)
 
 
 class HomgarHome:
-    """
-    Represents a home in Homgar.
-    A home can have a number of hubs, each of which can contain sensors/controllers (subdevices).
-    """
-    def __init__(self, hid, name):
-        self.hid = hid
-        self.name = name
+    """Representation of a HomGar home."""
+
+    hid: str
+    name: str
+
+    def __init__(self, hid: str | int, name: str | None) -> None:
+        """Initialise the home model."""
+        self.hid = str(hid)
+        self.name = name or ""
 
 
 class HomgarDevice:
-    """
-    Base class for Homgar devices; both hubs and subdevices.
-    Each device has a model (name and code), name, some identifiers and may have alerts.
-    """
+    """Base class for HomGar devices."""
 
-    FRIENDLY_DESC = "Unknown HomGar device"
+    FRIENDLY_DESC: ClassVar[str] = "Unknown HomGar device"
 
-    def __init__(self, model, model_code, name, did, mid, alerts, **kwargs):
-        self.model = model
-        self.model_code = model_code
-        self.name = name
-        self.did = did  # the unique device identifier of this device itself
-        self.mid = mid  # the unique identifier of the sensor network
-        self.alerts = alerts
+    def __init__(
+        self,
+        *,
+        model: str | None,
+        model_code: int | None,
+        name: str | None,
+        did: str | int | None,
+        mid: str | int | None,
+        alerts: Iterable[Any] | None = None,
+        device_name: str | None = None,
+        product_key: str | None = None,
+        **_: Any,
+    ) -> None:
+        """Initialise a device with metadata returned by the API."""
+        self.model: str | None = model
+        self.model_code: int | None = int(model_code) if model_code is not None else None
+        self.name: str = name or "Unknown"
+        self.did: str = str(did) if did is not None else "unknown"
+        self.mid: str = str(mid) if mid is not None else "unknown"
+        self.alerts: list[Any] = list(alerts or [])
+        self.device_name: str | None = device_name
+        self.product_key: str | None = product_key
 
-        self.address = None
-        self.rf_rssi = None
+        self.address: int | None = None
+        self.rf_rssi: int | None = None
 
-    def __str__(self):
-        return f"{self.FRIENDLY_DESC} \"{self.name}\" (DID {self.did})"
+    def __str__(self) -> str:
+        """Return a human readable description."""
+        return f'{self.FRIENDLY_DESC} "{self.name}" (DID {self.did})'
 
-    def get_device_status_ids(self) -> List[str]:
-        """
-        The response for /app/device/getDeviceStatus contains a subDeviceStatus for each of the subdevices.
-        This function returns which IDs in the subDeviceStatus apply to this device.
-        Usually this is just Dxx where xx is the device address, but the hub has some additional special keys.
-        set_device_status() will be called on this object for all subDeviceStatus entries matching any of the
-        return IDs.
-        :return: The subDeviceStatus this device should listen to.
-        """
+    def get_device_status_ids(self) -> list[str]:
+        """Return status identifiers that apply to this device."""
         return []
 
-    def set_device_status(self, api_obj: dict) -> None:
-        """
-        Called after a call to /app/device/getDeviceStatus with an entry from $.data.subDeviceStatus
-        that matches one of the IDs returned by get_device_status_ids().
-        Should update the device status with the contents of the given API response.
-        :param api_obj: The $.data.subDeviceStatus API response that should be used to update this device's status
-        """
-        if api_obj['id'] == f"D{self.address:02d}":
-            self._parse_status_d_value(api_obj['value'])
+    def set_device_status(self, api_obj: Mapping[str, Any]) -> None:
+        """Update the device state with data from the API."""
+        if self.address is None:
+            return
+        if api_obj.get("id") == f"D{self.address:02d}":
+            value = api_obj.get("value", "")
+            if isinstance(value, str):
+                self._parse_status_d_value(value)
 
-    def _parse_status_d_value(self, val: str) -> None:
-        """
-        Parses a $.data.subDeviceStatus[x].value field for an entry with ID 'Dxx' where xx is the device address.
-        These fields consist of a common part and a device-specific part separated by a ';'.
-        This call should update the device status.
-        :param val: Value of the $.data.subDeviceStatus[x].value field to apply
-        """
-        general_str, specific_str = val.split(';')
+    def _parse_status_d_value(self, payload: str) -> None:
+        """Parse the common and device-specific sections of a status payload."""
+        if ";" not in payload:
+            self._parse_general_status_d_value(payload)
+            return
+        general_str, specific_str = payload.split(";", 1)
         self._parse_general_status_d_value(general_str)
         self._parse_device_specific_status_d_value(specific_str)
 
-    def _parse_general_status_d_value(self, s: str):
-        """
-        Parses the part of a $.data.subDeviceStatus[x].value field before the ';' character,
-        which has the same format for all subdevices. It has three ','-separated fields. The first and last fields
-        are always '1' in my case, I presume it's to do with battery state / connection state.
-        The second field is the RSSI in dBm.
-        :param s: The value to parse and apply
-        """
-        unknown_1, rf_rssi, unknown_2 = s.split(',')
-        self.rf_rssi = int(rf_rssi)
+    def _parse_general_status_d_value(self, value: str) -> None:
+        """Parse the general section, capturing the RF RSSI if present."""
+        parts = value.split(",")
+        if len(parts) >= 2:
+            try:
+                self.rf_rssi = int(parts[1])
+            except ValueError:
+                self.rf_rssi = None
 
-    def _parse_device_specific_status_d_value(self, s: str):
-        """
-        Parses the part of a $.data.subDeviceStatus[x].value field after the ';' character,
-        which is in a device-specific format.
-        Should update the device state.
-        :param s: The value to parse and apply
-        """
-        raise NotImplementedError()
+    def _parse_device_specific_status_d_value(self, value: str) -> None:
+        """Parse the device-specific section of the payload."""
+        raise NotImplementedError
 
 
 class HomgarHubDevice(HomgarDevice):
-    """
-    A hub acts as a gateway for sensors and actuators (subdevices).
-    A home contains an arbitrary number of hubs, each of which contains an arbitrary number of subdevices.
-    """
-    def __init__(self, subdevices, **kwargs):
+    """A hub acts as a gateway for sensors and actuators."""
+
+    def __init__(self, *, subdevices: Iterable[HomgarDevice] | None = None, **kwargs: Any) -> None:
+        """Initialise the hub and store its subdevices."""
         super().__init__(**kwargs)
         self.address = 1
-        self.subdevices = subdevices
+        self.subdevices: list[HomgarDevice] = list(subdevices or [])
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """Return a human readable description for the hub."""
         return f"{super().__str__()} with {len(self.subdevices)} subdevices"
 
-    def _parse_device_specific_status_d_value(self, s):
-        pass
+    def _parse_device_specific_status_d_value(self, value: str) -> None:
+        """Store raw payload data produced by the hub."""
+        self.alerts.append({"raw_status": value})
 
 
 class HomgarSubDevice(HomgarDevice):
-    """
-    A subdevice is a device that is associated with a hub.
-    It can be a sensor or an actuator.
-    """
-    def __init__(self, address, port_number, **kwargs):
-        super().__init__(**kwargs)
-        self.address = address  # device address within the sensor network
-        self.port_number = port_number  # the number of ports on the device, e.g. 2 for the 2-zone water timer
+    """A device that is associated with a hub."""
 
-    def __str__(self):
+    def __init__(self, *, address: int, port_number: int, **kwargs: Any) -> None:
+        """Initialise the subdevice address and port metadata."""
+        super().__init__(**kwargs)
+        self.address = address
+        self.port_number = port_number
+
+    def __str__(self) -> str:
+        """Return a human readable description for the subdevice."""
         return f"{super().__str__()} at address {self.address}"
 
-    def get_device_status_ids(self):
+    def get_device_status_ids(self) -> list[str]:
+        """Return identifiers for status updates relevant to this device."""
         return [f"D{self.address:02d}"]
 
-    def _parse_device_specific_status_d_value(self, s):
-        pass
+    def _parse_device_specific_status_d_value(self, value: str) -> None:
+        """Store raw payload for subclasses that do not override parsing."""
+        self.alerts.append({"raw_status": value})
 
 
 class RainPointDisplayHub(HomgarHubDevice):
-    MODEL_CODES = [264]
-    FRIENDLY_DESC = "Irrigation Display Hub"
+    """RainPoint irrigation display hub."""
 
-    def __init__(self, **kwargs):
+    MODEL_CODES: ClassVar[list[int]] = [264]
+    FRIENDLY_DESC: ClassVar[str] = "Irrigation Display Hub"
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialise placeholder attributes for the display hub."""
         super().__init__(**kwargs)
-        self.wifi_rssi = None
-        self.battery_state = None
-        self.connected = None
+        self.wifi_rssi: int | None = None
+        self.battery_state: int | None = None
+        self.connected: bool | None = None
 
-        self.temp_mk_current = None
-        self.temp_mk_daily_max = None
-        self.temp_mk_daily_min = None
-        self.temp_trend = None
-        self.hum_current = None
-        self.hum_daily_max = None
-        self.hum_daily_min = None
-        self.hum_trend = None
-        self.press_pa_current = None
-        self.press_pa_daily_max = None
-        self.press_pa_daily_min = None
-        self.press_trend = None
+        self.temp_mk_current: int | None = None
+        self.temp_mk_daily_max: int | None = None
+        self.temp_mk_daily_min: int | None = None
+        self.temp_trend: int | None = None
+        self.hum_current: int | None = None
+        self.hum_daily_max: int | None = None
+        self.hum_daily_min: int | None = None
+        self.hum_trend: int | None = None
+        self.press_pa_current: int | None = None
+        self.press_pa_daily_max: int | None = None
+        self.press_pa_daily_min: int | None = None
+        self.press_trend: int | None = None
 
-    def get_device_status_ids(self):
+    def get_device_status_ids(self) -> list[str]:
+        """Return identifiers for hub-specific status updates."""
         return ["connected", "state", "D01"]
 
-    def set_device_status(self, api_obj):
-        dev_id = api_obj['id']
-        val = api_obj['value']
-        if dev_id == "state":
-            self.battery_state, self.wifi_rssi = [int(s) for s in val.split(',')]
+    def set_device_status(self, api_obj: Mapping[str, Any]) -> None:
+        """Handle hub-specific updates before delegating to the base class."""
+        dev_id = api_obj.get("id")
+        val = api_obj.get("value")
+        if dev_id == "state" and isinstance(val, str):
+            parts = [segment for segment in val.split(",") if segment]
+            if len(parts) >= 1:
+                try:
+                    self.battery_state = int(parts[0])
+                except ValueError:
+                    self.battery_state = None
+            if len(parts) >= 2:
+                try:
+                    self.wifi_rssi = int(parts[1])
+                except ValueError:
+                    self.wifi_rssi = None
         elif dev_id == "connected":
-            self.connected = int(val) == 1
+            self.connected = str(val) == "1"
         else:
             super().set_device_status(api_obj)
 
-    def _parse_device_specific_status_d_value(self, s):
-        """
-        Observed example value:
-        781(781/723/1),52(64/50/1),P=10213(10222/10205/1),
+    def _parse_device_specific_status_d_value(self, value: str) -> None:
+        """Parse the display hub payload into temperature, humidity, and pressure statistics.
 
-        Deduced meaning:
-        temp[.1F](day-max/day-min/trend?),humidity[%](day-max/day-min/trend?),P=pressure[Pa](day-max/day-min/trend?),
+        Observed example value: ``781(781/723/1),52(64/50/1),P=10213(10222/10205/1)``.
+
+        Deduced meaning: temperature, humidity, and pressure with day statistics.
         """
-        temp_str, hum_str, press_str, *_ = s.split(',')
-        self.temp_mk_current, self.temp_mk_daily_max, self.temp_mk_daily_min, self.temp_trend = [_temp_to_mk(v) for v in _parse_stats_value(temp_str)]
+
+        temp_str, hum_str, press_str, *_ = value.split(",")
+        temp_stats = _parse_stats_value(temp_str)
+        converted_temp = tuple(_temp_to_mk(stat) if stat is not None else None for stat in temp_stats)
+        (
+            self.temp_mk_current,
+            self.temp_mk_daily_max,
+            self.temp_mk_daily_min,
+            self.temp_trend,
+        ) = converted_temp
         self.hum_current, self.hum_daily_max, self.hum_daily_min, self.hum_trend = _parse_stats_value(hum_str)
-        self.press_pa_current, self.press_pa_daily_max, self.press_pa_daily_min, self.press_trend = _parse_stats_value(press_str[2:])
+        press_stats = _parse_stats_value(press_str[2:])
+        (
+            self.press_pa_current,
+            self.press_pa_daily_max,
+            self.press_pa_daily_min,
+            self.press_trend,
+        ) = press_stats
 
-    def __str__(self):
-        s = super().__str__()
-        if self.temp_mk_current:
-            s += f": {self.temp_mk_current*1e-3:.1f}K / {self.hum_current}% / {self.press_pa_current}Pa"
-        return s
+    def __str__(self) -> str:
+        """Return a human readable description including current readings."""
+        base = super().__str__()
+        if self.temp_mk_current is not None:
+            celsius = self.temp_mk_current * 1e-3 - 273.15
+            base += f": {celsius:.1f}°C / {self.hum_current}% / {self.press_pa_current}Pa"
+        return base
+
+
+class RainPointGatewayHub(HomgarHubDevice):
+    """RainPoint gateway hub used by newer hardware revisions."""
+
+    MODEL_CODES: ClassVar[list[int]] = [273]
+    FRIENDLY_DESC: ClassVar[str] = "RainPoint Gateway Hub"
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialise placeholder attributes for the gateway hub."""
+        super().__init__(**kwargs)
+        self.battery_level: int | None = None
+        self.wifi_rssi: int | None = None
+        self.connected: bool | None = None
+
+    def get_device_status_ids(self) -> list[str]:
+        """Return identifiers for gateway-specific status updates."""
+        return ["connected", "state", "D01"]
+
+    def set_device_status(self, api_obj: Mapping[str, Any]) -> None:
+        """Handle gateway specific updates before delegating to the base class."""
+        dev_id = api_obj.get("id")
+        val = api_obj.get("value")
+        if dev_id == "state" and isinstance(val, str):
+            parts = [segment for segment in val.split(",") if segment]
+            if parts:
+                try:
+                    self.battery_level = int(parts[0])
+                except ValueError:
+                    self.battery_level = None
+            if len(parts) > 1:
+                try:
+                    self.wifi_rssi = int(parts[1])
+                except ValueError:
+                    self.wifi_rssi = None
+        elif dev_id == "connected":
+            self.connected = str(val) == "1"
+        else:
+            super().set_device_status(api_obj)
 
 
 class RainPointSoilMoistureSensor(HomgarSubDevice):
-    MODEL_CODES = [72]
-    FRIENDLY_DESC = "Soil Moisture Sensor"
+    """RainPoint soil moisture sensor."""
 
-    def __init__(self, **kwargs):
+    MODEL_CODES: ClassVar[list[int]] = [72]
+    FRIENDLY_DESC: ClassVar[str] = "Soil Moisture Sensor"
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialise placeholder attributes for the soil sensor."""
         super().__init__(**kwargs)
-        self.temp_mk_current = None
-        self.moist_percent_current = None
-        self.light_lux_current = None
+        self.temp_mk_current: int | None = None
+        self.moist_percent_current: int | None = None
+        self.light_lux_current: float | None = None
 
-    def _parse_device_specific_status_d_value(self, s):
-        """
-        Observed example value:
-        766,52,G=31351
-
-        Deduced meaning:
-        temp[.1F],soil-moisture[%],G=light[.1lux]
-        """
-        temp_str, moist_str, light_str = s.split(',')
+    def _parse_device_specific_status_d_value(self, value: str) -> None:
+        """Parse the soil moisture payload into temperature, soil, and light readings."""
+        temp_str, moist_str, light_str = value.split(",")
         self.temp_mk_current = _temp_to_mk(temp_str)
         self.moist_percent_current = int(moist_str)
-        self.light_lux_current = int(light_str[2:]) * .1
+        self.light_lux_current = int(light_str[2:]) * 0.1
 
-    def __str__(self):
-        s = super().__str__()
-        if self.temp_mk_current:
-            s += f": {self.temp_mk_current*1e-3-273.15:.1f}°C / {self.moist_percent_current}% / {self.light_lux_current:.1f}lx"
-        return s
+    def __str__(self) -> str:
+        """Return a human readable description including current readings."""
+        base = super().__str__()
+        if self.temp_mk_current is not None and self.moist_percent_current is not None:
+            celsius = self.temp_mk_current * 1e-3 - 273.15
+            base += f": {celsius:.1f}°C / {self.moist_percent_current}% / {self.light_lux_current:.1f}lx"
+        return base
 
 
 class RainPointRainSensor(HomgarSubDevice):
-    MODEL_CODES = [87]
-    FRIENDLY_DESC = "High Precision Rain Sensor"
+    """RainPoint rainfall sensor."""
 
-    def __init__(self, **kwargs):
+    MODEL_CODES: ClassVar[list[int]] = [87]
+    FRIENDLY_DESC: ClassVar[str] = "High Precision Rain Sensor"
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialise placeholder attributes for the rain sensor."""
         super().__init__(**kwargs)
-        self.rainfall_mm_total = None
-        self.rainfall_mm_hour = None
-        self.rainfall_mm_daily = None
-        self.rainfall_mm_total = None
+        self.rainfall_mm_total: float | None = None
+        self.rainfall_mm_hour: float | None = None
+        self.rainfall_mm_daily: float | None = None
+        self.rainfall_mm_7days: float | None = None
 
-    def _parse_device_specific_status_d_value(self, s):
-        """
-        Observed example value:
-        R=270(0/0/270)
+    def _parse_device_specific_status_d_value(self, value: str) -> None:
+        """Parse the rainfall payload into rolling accumulation metrics."""
+        total, hour, daily, seven_day = _parse_stats_value(value[2:])
+        if total is not None:
+            self.rainfall_mm_total = total * 0.1
+        if hour is not None:
+            self.rainfall_mm_hour = hour * 0.1
+        if daily is not None:
+            self.rainfall_mm_daily = daily * 0.1
+        if seven_day is not None:
+            self.rainfall_mm_7days = seven_day * 0.1
 
-        Deduced meaning:
-        R=total?[.1mm](hour?[.1mm]/24hours?[.1mm]/7days?[.1mm])
-        """
-        self.rainfall_mm_total, self.rainfall_mm_hour, self.rainfall_mm_daily, self.rainfall_mm_7days = [.1*v for v in _parse_stats_value(s[2:])]
-
-    def __str__(self):
-        s = super().__str__()
-        if self.rainfall_mm_total:
-            s += f": {self.rainfall_mm_total}mm total / {self.rainfall_mm_hour}mm 1h / {self.rainfall_mm_daily}mm 24h / {self.rainfall_mm_7days}mm 7days"
-        return s
+    def __str__(self) -> str:
+        """Return a human readable description including rainfall totals."""
+        base = super().__str__()
+        if self.rainfall_mm_total is not None:
+            base += (
+                f": {self.rainfall_mm_total}mm total / {self.rainfall_mm_hour}mm 1h / "
+                f"{self.rainfall_mm_daily}mm 24h / {self.rainfall_mm_7days}mm 7days"
+            )
+        return base
 
 
 class RainPointAirSensor(HomgarSubDevice):
-    MODEL_CODES = [262]
-    FRIENDLY_DESC = "Outdoor Air Humidity Sensor"
+    """RainPoint outdoor air sensor."""
 
-    def __init__(self, **kwargs):
+    MODEL_CODES: ClassVar[list[int]] = [262]
+    FRIENDLY_DESC: ClassVar[str] = "Outdoor Air Humidity Sensor"
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialise placeholder attributes for the air sensor."""
         super().__init__(**kwargs)
-        self.temp_mk_current = None
-        self.temp_mk_daily_max = None
-        self.temp_mk_daily_min = None
-        self.temp_trend = None
-        self.hum_current = None
-        self.hum_daily_max = None
-        self.hum_daily_min = None
-        self.hum_trend = None
+        self.temp_mk_current: int | None = None
+        self.temp_mk_daily_max: int | None = None
+        self.temp_mk_daily_min: int | None = None
+        self.temp_trend: int | None = None
+        self.hum_current: int | None = None
+        self.hum_daily_max: int | None = None
+        self.hum_daily_min: int | None = None
+        self.hum_trend: int | None = None
 
-    def _parse_device_specific_status_d_value(self, s):
-        """
-        Observed example value:
-        755(1020/588/1),54(91/24/1),
-
-        Deduced meaning:
-        temp[.1F](day-max/day-min/trend?),humidity[%](day-max/day-min/trend?)
-        """
-        temp_str, hum_str, *_ = s.split(',')
-        self.temp_mk_current, self.temp_mk_daily_max, self.temp_mk_daily_min, self.temp_trend = [_temp_to_mk(v) for v in _parse_stats_value(temp_str)]
+    def _parse_device_specific_status_d_value(self, value: str) -> None:
+        """Parse the air sensor payload into temperature and humidity statistics."""
+        temp_str, hum_str, *_ = value.split(",")
+        temp_stats = _parse_stats_value(temp_str)
+        converted_temp = tuple(_temp_to_mk(stat) if stat is not None else None for stat in temp_stats)
+        (
+            self.temp_mk_current,
+            self.temp_mk_daily_max,
+            self.temp_mk_daily_min,
+            self.temp_trend,
+        ) = converted_temp
         self.hum_current, self.hum_daily_max, self.hum_daily_min, self.hum_trend = _parse_stats_value(hum_str)
 
-    def __str__(self):
-        s = super().__str__()
-        if self.temp_mk_current:
-            s += f": {self.temp_mk_current*1e-3-273.15:.1f}°C / {self.hum_current}%"
-        return s
+    def __str__(self) -> str:
+        """Return a human readable description including temperature and humidity."""
+        base = super().__str__()
+        if self.temp_mk_current is not None:
+            celsius = self.temp_mk_current * 1e-3 - 273.15
+            base += f": {celsius:.1f}°C / {self.hum_current}%"
+        return base
+
+
+class RainPointPoolSensor(HomgarSubDevice):
+    """RainPoint pool temperature sensor."""
+
+    MODEL_CODES: ClassVar[list[int]] = [268]
+    FRIENDLY_DESC: ClassVar[str] = "Pool Temperature Sensor"
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialise placeholder attributes for the pool sensor."""
+        super().__init__(**kwargs)
+        self.water_temp_c: float | None = None
+        self.temp_mk_current: int | None = None
+        self.battery_level: int | None = None
+        self.raw_status: str | None = None
+
+    def _parse_device_specific_status_d_value(self, value: str) -> None:
+        """Store the raw payload for downstream interpretation."""
+        self.raw_status = value
 
 
 class RainPoint2ZoneTimer(HomgarSubDevice):
-    MODEL_CODES = [261]
-    FRIENDLY_DESC = "2-Zone Water Timer"
+    """RainPoint two-zone water timer."""
 
-    def _parse_device_specific_status_d_value(self, s):
+    MODEL_CODES: ClassVar[list[int]] = [261]
+    FRIENDLY_DESC: ClassVar[str] = "2-Zone Water Timer"
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialise placeholder attributes for the timer."""
+        super().__init__(**kwargs)
+        self.zone_status: str | None = None
+
+    def _parse_device_specific_status_d_value(self, value: str) -> None:
+        """Store the raw zone status for further analysis.
+
+        Observed example value: ``0,9,0,0,0,0|0,1291,0,0,0,0``.
         """
-        TODO deduce meaning of these fields.
-        Observed example value:
-        0,9,0,0,0,0|0,1291,0,0,0,0
 
-        What we know so far:
-        left/right zone separated by '|' character
-        fields for each zone: ?,last-usage[.1l],?,?,?,?
-        """
-        pass
+        self.zone_status = value
 
 
-MODEL_CODE_MAPPING = {
-    code: clazz
-    for clazz in (
+MODEL_CODE_MAPPING: dict[int, type[HomgarDevice]] = {
+    code: device_class
+    for device_class in (
         RainPointDisplayHub,
+        RainPointGatewayHub,
         RainPointSoilMoistureSensor,
         RainPointRainSensor,
         RainPointAirSensor,
-        RainPoint2ZoneTimer
-    ) for code in clazz.MODEL_CODES
+        RainPointPoolSensor,
+        RainPoint2ZoneTimer,
+    )
+    for code in device_class.MODEL_CODES
 }
