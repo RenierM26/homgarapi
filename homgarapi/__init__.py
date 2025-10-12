@@ -3,6 +3,6 @@
 __version__ = "0.0.1"
 __author__ = 'Rembrand van Lakwijk'
 
-from .api import HomgarApi as HomgarApi, HomgarApiException as HomgarApiException
+from .api import HomgarApi, HomgarApiException, load_product_models
 
-__all__ = ["HomgarApi", "HomgarApiException"]
+__all__ = ["HomgarApi", "HomgarApiException", "load_product_models"]

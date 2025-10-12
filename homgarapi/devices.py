@@ -6,6 +6,8 @@ from collections.abc import Iterable, Mapping
 import re
 from typing import Any, ClassVar, Final
 
+from homgarapi.dp_decoder import decode_status_payload
+
 ParsedStats = tuple[int | None, int | None, int | None, int | None]
 
 STATS_VALUE_REGEX: Final[re.Pattern[str]] = re.compile(r"^(\d+)\((\d+)/(\d+)/(\d+)\)")
@@ -29,6 +31,11 @@ def _temp_to_mk(raw_fahrenheit_tenths: str | int) -> int:
     raw_value = int(raw_fahrenheit_tenths)
     celsius = (raw_value * 0.1 - 32.0) * 5 / 9
     return round((celsius + 273.15) * 1000)
+
+
+def _celsius_to_mk(value: float) -> int:
+    """Convert degrees Celsius to millikelvin."""
+    return round((value + 273.15) * 1000)
 
 
 class HomgarHome:
@@ -70,6 +77,7 @@ class HomgarDevice:
         self.alerts: list[Any] = list(alerts or [])
         self.device_name: str | None = device_name
         self.product_key: str | None = product_key
+        self.status_fields: dict[str, Any] = {}
 
         self.address: int | None = None
         self.rf_rssi: int | None = None
@@ -291,13 +299,37 @@ class RainPointSoilMoistureSensor(HomgarSubDevice):
         self.temp_mk_current: int | None = None
         self.moist_percent_current: int | None = None
         self.light_lux_current: float | None = None
+        self.battery_state: str | None = None
+        self.battery_level_raw: int | None = None
+        self.signal_strength: int | None = None
+        self.raw_status: str | None = None
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Parse the soil moisture payload into temperature, soil, and light readings."""
+        if value.startswith(("10#", "11#")):
+            decoded = decode_status_payload(value, model_code=72)
+            vals = decoded.values
+            self.status_fields.update(vals)
+            if (temp_c := vals.get("temperature_c")) is not None:
+                self.temp_mk_current = _celsius_to_mk(temp_c)
+            if (moist := vals.get("humidity_pct")) is not None:
+                self.moist_percent_current = int(moist)
+            if (lux := vals.get("illuminance_lux")) is not None:
+                self.light_lux_current = float(lux)
+            if (battery_raw := vals.get("battery_state_raw")) is not None:
+                self.battery_level_raw = int(battery_raw)
+            if "battery_state" in vals:
+                self.battery_state = vals["battery_state"]
+            if (rssi := vals.get("signal_strength")) is not None:
+                self.signal_strength = int(rssi)
+            self.raw_status = value
+            return
+
         temp_str, moist_str, light_str = value.split(",")
         self.temp_mk_current = _temp_to_mk(temp_str)
         self.moist_percent_current = int(moist_str)
         self.light_lux_current = int(light_str[2:]) * 0.1
+        self.raw_status = value
 
     def __str__(self) -> str:
         """Return a human readable description including current readings."""
@@ -362,9 +394,27 @@ class RainPointAirSensor(HomgarSubDevice):
         self.hum_daily_max: int | None = None
         self.hum_daily_min: int | None = None
         self.hum_trend: int | None = None
+        self.battery_state: str | None = None
+        self.battery_level_raw: int | None = None
+        self.raw_status: str | None = None
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Parse the air sensor payload into temperature and humidity statistics."""
+        if value.startswith(("10#", "11#")):
+            decoded = decode_status_payload(value, model_code=262)
+            vals = decoded.values
+            self.status_fields.update(vals)
+            if (temp_c := vals.get("temperature_c")) is not None:
+                self.temp_mk_current = _celsius_to_mk(temp_c)
+            if (humidity := vals.get("humidity_pct")) is not None:
+                self.hum_current = int(humidity)
+            if (battery_raw := vals.get("battery_state_raw")) is not None:
+                self.battery_level_raw = int(battery_raw)
+            if "battery_state" in vals:
+                self.battery_state = vals["battery_state"]
+            self.raw_status = value
+            return
+
         temp_str, hum_str, *_ = value.split(",")
         temp_stats = _parse_stats_value(temp_str)
         converted_temp = tuple(_temp_to_mk(stat) if stat is not None else None for stat in temp_stats)
@@ -375,6 +425,7 @@ class RainPointAirSensor(HomgarSubDevice):
             self.temp_trend,
         ) = converted_temp
         self.hum_current, self.hum_daily_max, self.hum_daily_min, self.hum_trend = _parse_stats_value(hum_str)
+        self.raw_status = value
 
     def __str__(self) -> str:
         """Return a human readable description including temperature and humidity."""
@@ -396,11 +447,32 @@ class RainPointPoolSensor(HomgarSubDevice):
         super().__init__(**kwargs)
         self.water_temp_c: float | None = None
         self.temp_mk_current: int | None = None
+        self.water_temp_f: float | None = None
         self.battery_level: int | None = None
         self.raw_status: str | None = None
+        self.trend_raw: int | None = None
+        self.battery_state: str | None = None
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
-        """Store the raw payload for downstream interpretation."""
+        """Decode the raw payload using the product model definitions."""
+        if value.startswith(("10#", "11#")):
+            decoded = decode_status_payload(value, model_code=268)
+            vals = decoded.values
+            self.status_fields.update(vals)
+            if (temp_c := vals.get("temperature_c")) is not None:
+                self.water_temp_c = temp_c
+                self.temp_mk_current = _celsius_to_mk(temp_c)
+            if (temp_f := vals.get("temperature_f")) is not None:
+                self.water_temp_f = temp_f
+            if (battery_raw := vals.get("battery_state_raw")) is not None:
+                self.battery_level = int(battery_raw)
+            if "battery_state" in vals:
+                self.battery_state = vals["battery_state"]
+            if (trend := vals.get("trend_raw")) is not None:
+                self.trend_raw = int(trend)
+            self.raw_status = value
+            return
+
         self.raw_status = value
 
 

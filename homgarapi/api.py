@@ -6,7 +6,9 @@ import binascii
 from collections.abc import Mapping, MutableMapping, Sequence
 from datetime import UTC, datetime, timedelta
 import hashlib
+import json
 import os
+from pathlib import Path
 from typing import Any, cast
 
 from homgarapi.devices import (
@@ -267,3 +269,13 @@ class HomgarApi:
         remaining = datetime.fromtimestamp(expires_at, tz=UTC) - datetime.now(tz=UTC)
         if cache_email != email or remaining < timedelta(minutes=60):
             self.login(email, password, area_code=area_code)
+
+
+def load_product_models(path: str | os.PathLike[str] | None = None) -> Mapping[int, Mapping[str, Any]]:
+    """Load product model metadata from the bundled JSON file."""
+
+    target = Path(path) if path is not None else Path(__file__).parent / "productmode.json"
+    payload = json.loads(target.read_text(encoding="utf-8"))
+
+    models: list[Mapping[str, Any]] = payload["data"]["models"]
+    return {int(model["modelCode"]): model for model in models}
