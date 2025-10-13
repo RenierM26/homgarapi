@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import Any
-
-from homgarapi.api import load_product_models
 
 
 @dataclass(frozen=True)
@@ -17,11 +17,16 @@ class DecodedStatus:
     raw_items: list[tuple[int, bytes]]
 
 
-_PRODUCT_MODELS = load_product_models()
+def _load_product_models() -> Mapping[int, Mapping[str, Any]]:
+    target = Path(__file__).parent / "productmode.json"
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    models: list[Mapping[str, Any]] = payload["data"]["models"]
+    return {int(model["modelCode"]): model for model in models}
+
+
+_PRODUCT_MODELS = _load_product_models()
 _DP_SPECS_BY_MODEL: dict[int, dict[int, Mapping[str, Any]]] = {
-    model_code: {
-        int(entry["dpCode"]): entry["specs"] for entry in model.get("dp", [])
-    }
+    model_code: {int(entry["dpCode"]): entry["specs"] for entry in model.get("dp", [])}
     for model_code, model in _PRODUCT_MODELS.items()
 }
 
@@ -93,11 +98,11 @@ def _decode_numeric(value: bytes, specs: Mapping[str, Any]) -> float | int:
         decimal = 0
 
     data_type_sub = specs.get("dataTypeSub")
-    signed = data_type_sub == 6 or data_type_sub == "6"
+    signed = str(data_type_sub) == "6"
 
     raw: int = int.from_bytes(value, byteorder="little", signed=signed)
     if decimal:
-        result: float = float(raw) / (10 ** decimal)
+        result: float = float(raw) / (10**decimal)
         return result
     return raw
 

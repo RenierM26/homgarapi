@@ -6,11 +6,14 @@ from collections.abc import Iterable, Mapping
 import re
 from typing import Any, ClassVar, Final
 
-from homgarapi.dp_decoder import decode_status_payload
+from .dp_decoder import decode_status_payload
+from .logutil import get_logger
 
 ParsedStats = tuple[int | None, int | None, int | None, int | None]
 
 STATS_VALUE_REGEX: Final[re.Pattern[str]] = re.compile(r"^(\d+)\((\d+)/(\d+)/(\d+)\)")
+
+_LOGGER = get_logger(__file__)
 
 
 def _parse_stats_value(value: str) -> ParsedStats:
@@ -70,7 +73,9 @@ class HomgarDevice:
     ) -> None:
         """Initialise a device with metadata returned by the API."""
         self.model: str | None = model
-        self.model_code: int | None = int(model_code) if model_code is not None else None
+        self.model_code: int | None = (
+            int(model_code) if model_code is not None else None
+        )
         self.name: str = name or "Unknown"
         self.did: str = str(did) if did is not None else "unknown"
         self.mid: str = str(mid) if mid is not None else "unknown"
@@ -78,6 +83,7 @@ class HomgarDevice:
         self.device_name: str | None = device_name
         self.product_key: str | None = product_key
         self.status_fields: dict[str, Any] = {}
+        self.last_status_payload: Mapping[str, Any] | None = None
 
         self.address: int | None = None
         self.rf_rssi: int | None = None
@@ -92,6 +98,7 @@ class HomgarDevice:
 
     def set_device_status(self, api_obj: Mapping[str, Any]) -> None:
         """Update the device state with data from the API."""
+        self.last_status_payload = api_obj
         if self.address is None:
             return
         if api_obj.get("id") == f"D{self.address:02d}":
@@ -103,6 +110,9 @@ class HomgarDevice:
         """Parse the common and device-specific sections of a status payload."""
         if ";" not in payload:
             self._parse_general_status_d_value(payload)
+            # Also process device-specific data when the payload does not contain
+            # a dedicated separator (newer TLV payloads use this format).
+            self._parse_device_specific_status_d_value(payload)
             return
         general_str, specific_str = payload.split(";", 1)
         self._parse_general_status_d_value(general_str)
@@ -125,7 +135,9 @@ class HomgarDevice:
 class HomgarHubDevice(HomgarDevice):
     """A hub acts as a gateway for sensors and actuators."""
 
-    def __init__(self, *, subdevices: Iterable[HomgarDevice] | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self, *, subdevices: Iterable[HomgarDevice] | None = None, **kwargs: Any
+    ) -> None:
         """Initialise the hub and store its subdevices."""
         super().__init__(**kwargs)
         self.address = 1
@@ -223,14 +235,18 @@ class RainPointDisplayHub(HomgarHubDevice):
 
         temp_str, hum_str, press_str, *_ = value.split(",")
         temp_stats = _parse_stats_value(temp_str)
-        converted_temp = tuple(_temp_to_mk(stat) if stat is not None else None for stat in temp_stats)
+        converted_temp = tuple(
+            _temp_to_mk(stat) if stat is not None else None for stat in temp_stats
+        )
         (
             self.temp_mk_current,
             self.temp_mk_daily_max,
             self.temp_mk_daily_min,
             self.temp_trend,
         ) = converted_temp
-        self.hum_current, self.hum_daily_max, self.hum_daily_min, self.hum_trend = _parse_stats_value(hum_str)
+        self.hum_current, self.hum_daily_max, self.hum_daily_min, self.hum_trend = (
+            _parse_stats_value(hum_str)
+        )
         press_stats = _parse_stats_value(press_str[2:])
         (
             self.press_pa_current,
@@ -244,7 +260,9 @@ class RainPointDisplayHub(HomgarHubDevice):
         base = super().__str__()
         if self.temp_mk_current is not None:
             celsius = self.temp_mk_current * 1e-3 - 273.15
-            base += f": {celsius:.1f}°C / {self.hum_current}% / {self.press_pa_current}Pa"
+            base += (
+                f": {celsius:.1f}°C / {self.hum_current}% / {self.press_pa_current}Pa"
+            )
         return base
 
 
@@ -310,6 +328,11 @@ class RainPointSoilMoistureSensor(HomgarSubDevice):
             decoded = decode_status_payload(value, model_code=72)
             vals = decoded.values
             self.status_fields.update(vals)
+            _LOGGER.debug(
+                "Decoded soil payload for %s: %s",
+                self.did,
+                vals,
+            )
             if (temp_c := vals.get("temperature_c")) is not None:
                 self.temp_mk_current = _celsius_to_mk(temp_c)
             if (moist := vals.get("humidity_pct")) is not None:
@@ -353,9 +376,59 @@ class RainPointRainSensor(HomgarSubDevice):
         self.rainfall_mm_hour: float | None = None
         self.rainfall_mm_daily: float | None = None
         self.rainfall_mm_7days: float | None = None
+        self.battery_level_raw: int | None = None
+        self.battery_state: str | None = None
+        self.signal_strength: int | None = None
+        self.raw_status: str | None = None
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Parse the rainfall payload into rolling accumulation metrics."""
+        if value.startswith(("10#", "11#")):
+            decoded = decode_status_payload(value, model_code=87)
+            vals = decoded.values
+            self.status_fields.update(vals)
+
+            def _get_float(name: str) -> float | None:
+                raw_val = vals.get(name)
+                if raw_val is None:
+                    return None
+                try:
+                    return float(raw_val)
+                except (TypeError, ValueError):
+                    return None
+
+            if (total := _get_float("STA_TOTAL_RAIN")) is not None:
+                self.rainfall_mm_total = total
+            if (hour := _get_float("STA_HOUR_RAIN")) is not None:
+                self.rainfall_mm_hour = hour
+            if (daily := _get_float("STA_DAY_RAIN")) is not None:
+                self.rainfall_mm_daily = daily
+            if (seven_day := _get_float("STA_7DAY_RAIN")) is not None:
+                self.rainfall_mm_7days = seven_day
+
+            if (signal := vals.get("signal_strength")) is not None:
+                try:
+                    signal_int = int(signal)
+                except (TypeError, ValueError):
+                    signal_int = None
+                self.rf_rssi = signal_int
+                self.signal_strength = signal_int
+
+            if (battery_raw := vals.get("battery_state_raw")) is not None:
+                try:
+                    self.battery_level_raw = int(battery_raw)
+                except (TypeError, ValueError):
+                    self.battery_level_raw = None
+            if "battery_state" in vals:
+                battery_state = vals["battery_state"]
+                if isinstance(battery_state, str):
+                    self.battery_state = battery_state
+                else:
+                    self.battery_state = str(battery_state)
+
+            self.raw_status = value
+            return
+
         total, hour, daily, seven_day = _parse_stats_value(value[2:])
         if total is not None:
             self.rainfall_mm_total = total * 0.1
@@ -365,6 +438,7 @@ class RainPointRainSensor(HomgarSubDevice):
             self.rainfall_mm_daily = daily * 0.1
         if seven_day is not None:
             self.rainfall_mm_7days = seven_day * 0.1
+        self.raw_status = value
 
     def __str__(self) -> str:
         """Return a human readable description including rainfall totals."""
@@ -404,6 +478,11 @@ class RainPointAirSensor(HomgarSubDevice):
             decoded = decode_status_payload(value, model_code=262)
             vals = decoded.values
             self.status_fields.update(vals)
+            _LOGGER.debug(
+                "Decoded air payload for %s: %s",
+                self.did,
+                vals,
+            )
             if (temp_c := vals.get("temperature_c")) is not None:
                 self.temp_mk_current = _celsius_to_mk(temp_c)
             if (humidity := vals.get("humidity_pct")) is not None:
@@ -417,14 +496,18 @@ class RainPointAirSensor(HomgarSubDevice):
 
         temp_str, hum_str, *_ = value.split(",")
         temp_stats = _parse_stats_value(temp_str)
-        converted_temp = tuple(_temp_to_mk(stat) if stat is not None else None for stat in temp_stats)
+        converted_temp = tuple(
+            _temp_to_mk(stat) if stat is not None else None for stat in temp_stats
+        )
         (
             self.temp_mk_current,
             self.temp_mk_daily_max,
             self.temp_mk_daily_min,
             self.temp_trend,
         ) = converted_temp
-        self.hum_current, self.hum_daily_max, self.hum_daily_min, self.hum_trend = _parse_stats_value(hum_str)
+        self.hum_current, self.hum_daily_max, self.hum_daily_min, self.hum_trend = (
+            _parse_stats_value(hum_str)
+        )
         self.raw_status = value
 
     def __str__(self) -> str:
@@ -459,6 +542,11 @@ class RainPointPoolSensor(HomgarSubDevice):
             decoded = decode_status_payload(value, model_code=268)
             vals = decoded.values
             self.status_fields.update(vals)
+            _LOGGER.debug(
+                "Decoded pool payload for %s: %s",
+                self.did,
+                vals,
+            )
             if (temp_c := vals.get("temperature_c")) is not None:
                 self.water_temp_c = temp_c
                 self.temp_mk_current = _celsius_to_mk(temp_c)

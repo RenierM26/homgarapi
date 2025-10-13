@@ -11,14 +11,10 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
-from homgarapi.devices import (
-    MODEL_CODE_MAPPING,
-    HomgarDevice,
-    HomgarHome,
-    HomgarHubDevice,
-)
-from homgarapi.logutil import TRACE, get_logger
 import requests
+
+from .devices import MODEL_CODE_MAPPING, HomgarDevice, HomgarHome, HomgarHubDevice
+from .logutil import TRACE, get_logger
 
 logger = get_logger(__file__)
 
@@ -114,7 +110,9 @@ class HomgarApi:
 
         :returns: Mapping containing model metadata (`version`, `modelCodes`, `models`, ...).
         """
-        return cast(Mapping[str, Any], self._get_json("/app/common/core/productModel/json"))
+        return cast(
+            Mapping[str, Any], self._get_json("/app/common/core/productModel/json")
+        )
 
     def login(self, email: str, password: str, area_code: str = "31") -> None:
         """Perform a login and cache the resulting tokens.
@@ -142,11 +140,17 @@ class HomgarApi:
         :returns: List of `HomgarHome` instances.
         """
         data = self._get_json("/app/member/appHome/list")
-        homes: Sequence[Mapping[str, Any]] = data or []
-        return [
-            HomgarHome(hid=home.get("hid"), name=home.get("homeName"))
-            for home in homes
-        ]
+        homes_data: Sequence[Mapping[str, Any]] = data or []
+        result: list[HomgarHome] = []
+        for home in homes_data:
+            hid_value = home.get("hid")
+            if not isinstance(hid_value, (str, int)):
+                hid_value = "" if hid_value is None else str(hid_value)
+            name_value = home.get("homeName")
+            if not isinstance(name_value, str):
+                name_value = "" if name_value is None else str(name_value)
+            result.append(HomgarHome(hid=hid_value, name=name_value))
+        return result
 
     def get_devices_for_hid(self, hid: str) -> list[HomgarHubDevice]:
         """Return hubs and subdevices for the provided home id.
@@ -188,7 +192,7 @@ class HomgarApi:
                     dev_data.get("model"),
                     model_code_value,
                 )
-            return cast(type[HomgarDevice] | None, device_class)
+            return device_class
 
         for hub_data in devices:
             subdevices: list[HomgarDevice] = []
@@ -201,8 +205,18 @@ class HomgarApi:
                     continue
                 subdevices.append(subdevice_class(**device_base_props(subdevice_data)))
 
-            hub_class = get_device_class(hub_data) or HomgarHubDevice
-            hubs.append(hub_class(**device_base_props(hub_data), subdevices=subdevices))
+            hub_class = get_device_class(hub_data)
+            if hub_class is not None and issubclass(hub_class, HomgarHubDevice):
+                hub_instance = hub_class(
+                    **device_base_props(hub_data),
+                    subdevices=subdevices,
+                )
+            else:
+                hub_instance = HomgarHubDevice(
+                    **device_base_props(hub_data),
+                    subdevices=subdevices,
+                )
+            hubs.append(hub_instance)
 
         return hubs
 
@@ -231,33 +245,58 @@ class HomgarApi:
                         raw_status = first_entry.get("status", [])
                         if isinstance(raw_status, Sequence):
                             status_payload = [
-                                item
-                                for item in raw_status
-                                if isinstance(item, Mapping)
+                                item for item in raw_status if isinstance(item, Mapping)
                             ]
             except HomgarApiException as err:
                 logger.debug("multipleDeviceStatus failed: %s", err)
 
         if status_payload is None:
-            data = self._get_json("/app/device/getDeviceStatus", params={"mid": str(hub.mid)})
-            raw_status = data.get("subDeviceStatus", []) if isinstance(data, Mapping) else []
+            data = self._get_json(
+                "/app/device/getDeviceStatus", params={"mid": str(hub.mid)}
+            )
+            raw_status = (
+                data.get("subDeviceStatus", []) if isinstance(data, Mapping) else []
+            )
             if isinstance(raw_status, Sequence):
-                status_payload = [item for item in raw_status if isinstance(item, Mapping)]
+                status_payload = [
+                    item for item in raw_status if isinstance(item, Mapping)
+                ]
             else:
                 status_payload = []
 
-        id_map = {
-            status_id: device
-            for device in (hub, *hub.subdevices)
-            for status_id in device.get_device_status_ids()
-        }
+        id_map: dict[str, HomgarDevice] = {}
+        for homgar_device in (hub, *hub.subdevices):
+            status_ids = list(homgar_device.get_device_status_ids())
+            device_did = getattr(homgar_device, "did", None)
+            if device_did is not None:
+                status_ids.append(str(device_did))
+            for status_id in status_ids:
+                id_map[str(status_id)] = homgar_device
 
         for subdevice_status in status_payload:
-            device = id_map.get(str(subdevice_status.get("id")))
-            if device is not None:
-                device.set_device_status(subdevice_status)
+            status_id_raw = subdevice_status.get("id")
+            if status_id_raw is None:
+                continue
+            status_key = str(status_id_raw)
+            matched_device: HomgarDevice | None = (
+                id_map.get(status_key)
+                or id_map.get(status_key.upper())
+                or id_map.get(status_key.lower())
+            )
+            if matched_device is None:
+                logger.debug(
+                    "Unmatched status entry for hub %s (%s): id=%s payload=%s",
+                    getattr(hub, "name", hub.mid),
+                    hub.mid,
+                    status_key,
+                    subdevice_status,
+                )
+                continue
+            matched_device.set_device_status(subdevice_status)
 
-    def ensure_logged_in(self, email: str, password: str, area_code: str = "31") -> None:
+    def ensure_logged_in(
+        self, email: str, password: str, area_code: str = "31"
+    ) -> None:
         """Ensure a valid token is present, refreshing if required.
 
         :param email: HomGar account e-mail address.
@@ -271,10 +310,14 @@ class HomgarApi:
             self.login(email, password, area_code=area_code)
 
 
-def load_product_models(path: str | os.PathLike[str] | None = None) -> Mapping[int, Mapping[str, Any]]:
+def load_product_models(
+    path: str | os.PathLike[str] | None = None,
+) -> Mapping[int, Mapping[str, Any]]:
     """Load product model metadata from the bundled JSON file."""
 
-    target = Path(path) if path is not None else Path(__file__).parent / "productmode.json"
+    target = (
+        Path(path) if path is not None else Path(__file__).parent / "productmode.json"
+    )
     payload = json.loads(target.read_text(encoding="utf-8"))
 
     models: list[Mapping[str, Any]] = payload["data"]["models"]

@@ -7,10 +7,11 @@ from pathlib import Path
 import pickle
 from typing import Any
 
-from homgarapi.api import HomgarApi
-from homgarapi.logutil import TRACE, get_logger
 from platformdirs import user_cache_dir
 import yaml
+
+from .api import HomgarApi
+from .logutil import TRACE, get_logger
 
 logging.addLevelName(TRACE, "TRACE")
 logger = get_logger(__file__)
@@ -42,8 +43,12 @@ def main() -> None:
         description="Demo of HomGar API client library",
         prog="homgarapi",
     )
-    argparse.add_argument("-v", "--verbose", action="store_true", help="Verbose (DEBUG) mode")
-    argparse.add_argument("-vv", "--very-verbose", action="store_true", help="Very verbose (TRACE) mode")
+    argparse.add_argument(
+        "-v", "--verbose", action="store_true", help="Verbose (DEBUG) mode"
+    )
+    argparse.add_argument(
+        "-vv", "--very-verbose", action="store_true", help="Very verbose (TRACE) mode"
+    )
     argparse.add_argument(
         "-c",
         "--cache",
@@ -57,9 +62,17 @@ def main() -> None:
     )
     args = argparse.parse_args()
 
-    logging.basicConfig(level=TRACE if args.very_verbose else logging.DEBUG if args.verbose else logging.INFO)
+    logging.basicConfig(
+        level=TRACE
+        if args.very_verbose
+        else logging.DEBUG
+        if args.verbose
+        else logging.INFO
+    )
 
-    cache_file: Path = args.cache or (Path(user_cache_dir("homgarapi", ensure_exists=True)) / "cache.pickle")
+    cache_file: Path = args.cache or (
+        Path(user_cache_dir("homgarapi", ensure_exists=True)) / "cache.pickle"
+    )
     config_file: Path = args.config
 
     cache: MutableMapping[str, Any] = {}
