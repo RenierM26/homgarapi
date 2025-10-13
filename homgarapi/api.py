@@ -13,6 +13,7 @@ from typing import Any, cast
 
 import requests
 
+from .auth import AuthRetryManager, AuthRetryPolicy
 from .devices import MODEL_CODE_MAPPING, HomgarDevice, HomgarHome, HomgarHubDevice
 from .logutil import TRACE, get_logger
 
@@ -52,6 +53,8 @@ class HomgarApi:
         self.session: requests.Session = requests_session or requests.Session()
         self.cache: MutableMapping[str, Any] = auth_cache or {}
         self.base = api_base_url.rstrip("/")
+        self._auth_manager = AuthRetryManager(policy=AuthRetryPolicy())
+        self._unknown_devices: list[Mapping[str, Any]] = []
 
     def _request(
         self,
@@ -202,6 +205,7 @@ class HomgarApi:
                     continue
                 subdevice_class = get_device_class(subdevice_data)
                 if subdevice_class is None:
+                    self._record_unknown_device(subdevice_data)
                     continue
                 subdevices.append(subdevice_class(**device_base_props(subdevice_data)))
 
@@ -216,6 +220,7 @@ class HomgarApi:
                     **device_base_props(hub_data),
                     subdevices=subdevices,
                 )
+                self._record_unknown_device(hub_data)
             hubs.append(hub_instance)
 
         return hubs
@@ -308,6 +313,65 @@ class HomgarApi:
         remaining = datetime.fromtimestamp(expires_at, tz=UTC) - datetime.now(tz=UTC)
         if cache_email != email or remaining < timedelta(minutes=60):
             self.login(email, password, area_code=area_code)
+
+    def ensure_logged_in_with_retries(
+        self,
+        email: str,
+        password: str,
+        area_code: str = "31",
+        *,
+        max_retries: int | None = None,
+    ) -> None:
+        """Ensure a valid session exists with retry/backoff behaviour."""
+        now = datetime.now(tz=UTC).timestamp()
+        policy = self._auth_manager.policy
+        original_max = policy.max_retries
+        if max_retries is not None:
+            policy.max_retries = max_retries
+
+        def attempt() -> None:
+            self.ensure_logged_in(email, password, area_code)
+
+        def wrap(reason: str, detail: float | None) -> HomgarApiException:
+            if reason == "rate_limited":
+                wait_msg = (
+                    f"Too many login failures, please wait {detail:.1f}s before retrying"
+                    if detail is not None
+                    else "Too many login failures, please wait before retrying"
+                )
+                return HomgarApiException(-1, wait_msg)
+            return HomgarApiException(-1, reason)
+
+        try:
+            self._auth_manager.execute(
+                attempt_ts=now,
+                func=attempt,
+                wrap_exception=wrap,
+            )
+        finally:
+            policy.max_retries = original_max
+        logger.debug("Successfully logged in to HomGar API")
+
+    def health_check(self) -> bool:
+        """Return True if the API responds to a basic call."""
+        try:
+            self.get_homes()
+        except HomgarApiException:
+            return False
+        return True
+
+    def get_unknown_devices(self) -> list[Mapping[str, Any]]:
+        """Return all device payloads that could not be classified."""
+        return list(self._unknown_devices)
+
+    def _record_unknown_device(self, payload: Mapping[str, Any]) -> None:
+        """Record a device payload that lacks a known model mapping."""
+        self._unknown_devices.append(dict(payload))
+        logger.warning(
+            "Encountered unsupported device (model=%s, modelCode=%s).",
+            payload.get("model"),
+            payload.get("modelCode"),
+        )
 
 
 def load_product_models(

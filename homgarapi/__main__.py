@@ -56,9 +56,23 @@ def main() -> None:
         help="Cache file to use. Should be writable, will be created if it does not exist.",
     )
     argparse.add_argument(
-        "config",
+        "--email",
+        help="HomGar account email address (overrides value in configuration file)",
+    )
+    argparse.add_argument(
+        "--password",
+        help="HomGar account password (overrides value in configuration file)",
+    )
+    argparse.add_argument(
+        "--unknown-output",
         type=Path,
-        help="Yaml file containing email and password to use to log in",
+        help="Optional path to write unsupported device report (YAML)",
+    )
+    argparse.add_argument(
+        "config",
+        nargs="?",
+        type=Path,
+        help="Optional YAML file containing authentication details",
     )
     args = argparse.parse_args()
 
@@ -73,7 +87,7 @@ def main() -> None:
     cache_file: Path = args.cache or (
         Path(user_cache_dir("homgarapi", ensure_exists=True)) / "cache.pickle"
     )
-    config_file: Path = args.config
+    config_file: Path | None = args.config
 
     cache: MutableMapping[str, Any] = {}
     try:
@@ -82,17 +96,57 @@ def main() -> None:
     except OSError:
         logger.info("Could not load cache, starting fresh")
 
-    with config_file.open("rb") as config_handle:
-        config = yaml.unsafe_load(config_handle)
-    if not isinstance(config, Mapping):
-        msg = f"Configuration file {config_file} must contain a mapping"
-        raise TypeError(msg)
-    config_mapping = {str(key): str(value) for key, value in config.items()}
+    config_mapping: dict[str, str] = {}
+    if config_file is not None:
+        with config_file.open("rb") as config_handle:
+            try:
+                config = yaml.safe_load(config_handle)
+            except yaml.YAMLError as exc:
+                raise ValueError(
+                    f"Failed parsing configuration file {config_file}"
+                ) from exc
+        if not isinstance(config, Mapping):
+            msg = f"Configuration file {config_file} must contain a mapping"
+            raise TypeError(msg)
+        config_mapping.update({str(key): str(value) for key, value in config.items()})
+
+    if args.email is not None:
+        config_mapping["email"] = args.email
+    if args.password is not None:
+        config_mapping["password"] = args.password
+
+    required_keys = {"email", "password"}
+    missing = required_keys - set(config_mapping)
+    if missing:
+        msg = (
+            "Authentication details must include both email and password. "
+            f"Missing: {', '.join(sorted(missing))}"
+        )
+        raise ValueError(msg)
 
     try:
         api = HomgarApi(cache)
         demo(api, config_mapping)
+        unknown_devices = api.get_unknown_devices()
+        if unknown_devices:
+            output_path = args.unknown_output or cache_file.with_name(
+                "unknown_devices.yaml"
+            )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("w", encoding="utf-8") as output_handle:
+                yaml.safe_dump(
+                    {"unknown_devices": unknown_devices},
+                    output_handle,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+            logger.warning(
+                "Unsupported devices detected. Details written to %s. "
+                "Please share this file when requesting support for new hardware.",
+                output_path,
+            )
     finally:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
         with cache_file.open("wb") as cache_handle:
             pickle.dump(cache, cache_handle)
 

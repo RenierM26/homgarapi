@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
 import re
 from typing import Any, ClassVar, Final
 
@@ -14,6 +15,25 @@ ParsedStats = tuple[int | None, int | None, int | None, int | None]
 STATS_VALUE_REGEX: Final[re.Pattern[str]] = re.compile(r"^(\d+)\((\d+)/(\d+)/(\d+)\)")
 
 _LOGGER = get_logger(__file__)
+
+
+def _convert_signal_strength(raw: float) -> int:
+    """Convert signal strength readings to signed dBm values when required."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return int(raw) if isinstance(raw, bool) else 0
+    # HomGar reports RSSI as unsigned where values > 127 should be interpreted as negative.
+    if value > 127:
+        return value - 256
+    return value
+
+
+def _mk_to_celsius(value: int | None) -> float | None:
+    """Convert millikelvin to Celsius."""
+    if value is None:
+        return None
+    return round(value * 1e-3 - 273.15, 1)
 
 
 def _parse_stats_value(value: str) -> ParsedStats:
@@ -84,6 +104,8 @@ class HomgarDevice:
         self.product_key: str | None = product_key
         self.status_fields: dict[str, Any] = {}
         self.last_status_payload: Mapping[str, Any] | None = None
+        self.last_seen: str | None = None
+        self.last_seen_ts: float | None = None
 
         self.address: int | None = None
         self.rf_rssi: int | None = None
@@ -99,12 +121,35 @@ class HomgarDevice:
     def set_device_status(self, api_obj: Mapping[str, Any]) -> None:
         """Update the device state with data from the API."""
         self.last_status_payload = api_obj
+        time_val = api_obj.get("time")
+        timestamp: float | None = None
+        if isinstance(time_val, (int, float)):
+            timestamp = float(time_val)
+        elif isinstance(time_val, str):
+            try:
+                timestamp = float(time_val)
+            except ValueError:
+                timestamp = None
+        if timestamp is not None:
+            if timestamp > 1e12:
+                timestamp /= 1000
+            try:
+                seen_dt = datetime.fromtimestamp(timestamp, tz=UTC)
+            except (OverflowError, OSError, ValueError):
+                seen_dt = None
+            if seen_dt is not None:
+                self.last_seen_ts = timestamp
+                self.last_seen = seen_dt.isoformat()
         if self.address is None:
             return
         if api_obj.get("id") == f"D{self.address:02d}":
             value = api_obj.get("value", "")
             if isinstance(value, str):
                 self._parse_status_d_value(value)
+
+    def supports_sensor(self, sensor_key: str) -> bool:
+        """Return True if this device supports the requested sensor key."""
+        return True
 
     def _parse_status_d_value(self, payload: str) -> None:
         """Parse the common and device-specific sections of a status payload."""
@@ -160,6 +205,7 @@ class HomgarSubDevice(HomgarDevice):
         super().__init__(**kwargs)
         self.address = address
         self.port_number = port_number
+        self.signal_strength: int | None = None
 
     def __str__(self) -> str:
         """Return a human readable description for the subdevice."""
@@ -179,6 +225,7 @@ class RainPointDisplayHub(HomgarHubDevice):
 
     MODEL_CODES: ClassVar[list[int]] = [264]
     FRIENDLY_DESC: ClassVar[str] = "Irrigation Display Hub"
+    HAS_BATTERY: ClassVar[bool] = False
 
     def __init__(self, **kwargs: Any) -> None:
         """Initialise placeholder attributes for the display hub."""
@@ -210,11 +257,6 @@ class RainPointDisplayHub(HomgarHubDevice):
         val = api_obj.get("value")
         if dev_id == "state" and isinstance(val, str):
             parts = [segment for segment in val.split(",") if segment]
-            if len(parts) >= 1:
-                try:
-                    self.battery_state = int(parts[0])
-                except ValueError:
-                    self.battery_state = None
             if len(parts) >= 2:
                 try:
                     self.wifi_rssi = int(parts[1])
@@ -265,12 +307,43 @@ class RainPointDisplayHub(HomgarHubDevice):
             )
         return base
 
+    @property
+    def temperature_c(self) -> float | None:
+        """Return current temperature in Celsius."""
+        return _mk_to_celsius(self.temp_mk_current)
+
+    @property
+    def temperature_c_max(self) -> float | None:
+        """Return daily maximum temperature in Celsius."""
+        return _mk_to_celsius(self.temp_mk_daily_max)
+
+    @property
+    def temperature_c_min(self) -> float | None:
+        """Return daily minimum temperature in Celsius."""
+        return _mk_to_celsius(self.temp_mk_daily_min)
+
+    @property
+    def humidity_pct(self) -> int | None:
+        """Return current relative humidity percentage."""
+        return self.hum_current
+
+    @property
+    def humidity_pct_max(self) -> int | None:
+        """Return daily maximum relative humidity percentage."""
+        return self.hum_daily_max
+
+    @property
+    def humidity_pct_min(self) -> int | None:
+        """Return daily minimum relative humidity percentage."""
+        return self.hum_daily_min
+
 
 class RainPointGatewayHub(HomgarHubDevice):
     """RainPoint gateway hub used by newer hardware revisions."""
 
     MODEL_CODES: ClassVar[list[int]] = [273]
     FRIENDLY_DESC: ClassVar[str] = "RainPoint Gateway Hub"
+    HAS_BATTERY: ClassVar[bool] = False
 
     def __init__(self, **kwargs: Any) -> None:
         """Initialise placeholder attributes for the gateway hub."""
@@ -289,11 +362,6 @@ class RainPointGatewayHub(HomgarHubDevice):
         val = api_obj.get("value")
         if dev_id == "state" and isinstance(val, str):
             parts = [segment for segment in val.split(",") if segment]
-            if parts:
-                try:
-                    self.battery_level = int(parts[0])
-                except ValueError:
-                    self.battery_level = None
             if len(parts) > 1:
                 try:
                     self.wifi_rssi = int(parts[1])
@@ -344,7 +412,9 @@ class RainPointSoilMoistureSensor(HomgarSubDevice):
             if "battery_state" in vals:
                 self.battery_state = vals["battery_state"]
             if (rssi := vals.get("signal_strength")) is not None:
-                self.signal_strength = int(rssi)
+                strength = _convert_signal_strength(rssi)
+                self.signal_strength = strength
+                self.rf_rssi = strength
             self.raw_status = value
             return
 
@@ -362,6 +432,21 @@ class RainPointSoilMoistureSensor(HomgarSubDevice):
             base += f": {celsius:.1f}°C / {self.moist_percent_current}% / {self.light_lux_current:.1f}lx"
         return base
 
+    @property
+    def temperature_c(self) -> float | None:
+        """Return current soil temperature in Celsius."""
+        return _mk_to_celsius(self.temp_mk_current)
+
+    @property
+    def humidity_pct(self) -> int | None:
+        """Return soil humidity percentage if available."""
+        return self.moist_percent_current
+
+    def supports_sensor(self, sensor_key: str) -> bool:
+        """Disable generic humidity sensor to avoid duplication."""
+        if sensor_key == "humidity":
+            return False
+        return super().supports_sensor(sensor_key)
 
 class RainPointRainSensor(HomgarSubDevice):
     """RainPoint rainfall sensor."""
@@ -408,7 +493,7 @@ class RainPointRainSensor(HomgarSubDevice):
 
             if (signal := vals.get("signal_strength")) is not None:
                 try:
-                    signal_int = int(signal)
+                    signal_int = _convert_signal_strength(signal)
                 except (TypeError, ValueError):
                     signal_int = None
                 self.rf_rssi = signal_int
@@ -471,6 +556,10 @@ class RainPointAirSensor(HomgarSubDevice):
         self.battery_state: str | None = None
         self.battery_level_raw: int | None = None
         self.raw_status: str | None = None
+        self.temp_c_max: float | None = None
+        self.temp_c_min: float | None = None
+        self.hum_pct_max: int | None = None
+        self.hum_pct_min: int | None = None
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Parse the air sensor payload into temperature and humidity statistics."""
@@ -483,10 +572,28 @@ class RainPointAirSensor(HomgarSubDevice):
                 self.did,
                 vals,
             )
+            if (temp_stats_raw := vals.get("MAX_TEM")) is not None:
+                stats_int = int(temp_stats_raw)
+                max_f = (stats_int >> 16) & 0xFFFF
+                min_f = stats_int & 0xFFFF
+                self.temp_mk_daily_max = _temp_to_mk(max_f)
+                self.temp_mk_daily_min = _temp_to_mk(min_f)
+                self.temp_c_max = _mk_to_celsius(self.temp_mk_daily_max)
+                self.temp_c_min = _mk_to_celsius(self.temp_mk_daily_min)
             if (temp_c := vals.get("temperature_c")) is not None:
                 self.temp_mk_current = _celsius_to_mk(temp_c)
+                self.temp_c_max = self.temp_c_max or temp_c
+                self.temp_c_min = self.temp_c_min or temp_c
             if (humidity := vals.get("humidity_pct")) is not None:
                 self.hum_current = int(humidity)
+                self.hum_pct_max = self.hum_pct_max or self.hum_current
+                self.hum_pct_min = self.hum_pct_min or self.hum_current
+            if (humidity_stats := vals.get("MAX_RH")) is not None:
+                stats_int = int(humidity_stats)
+                self.hum_daily_max = (stats_int >> 8) & 0xFF
+                self.hum_daily_min = stats_int & 0xFF
+                self.hum_pct_max = self.hum_daily_max
+                self.hum_pct_min = self.hum_daily_min
             if (battery_raw := vals.get("battery_state_raw")) is not None:
                 self.battery_level_raw = int(battery_raw)
             if "battery_state" in vals:
@@ -518,6 +625,36 @@ class RainPointAirSensor(HomgarSubDevice):
             base += f": {celsius:.1f}°C / {self.hum_current}%"
         return base
 
+    @property
+    def temperature_c(self) -> float | None:
+        """Return current air temperature in Celsius."""
+        return _mk_to_celsius(self.temp_mk_current)
+
+    @property
+    def temperature_c_max(self) -> float | None:
+        """Return daily maximum air temperature in Celsius."""
+        return self.temp_c_max or _mk_to_celsius(self.temp_mk_daily_max)
+
+    @property
+    def temperature_c_min(self) -> float | None:
+        """Return daily minimum air temperature in Celsius."""
+        return self.temp_c_min or _mk_to_celsius(self.temp_mk_daily_min)
+
+    @property
+    def humidity_pct(self) -> int | None:
+        """Return current relative humidity percentage."""
+        return self.hum_current
+
+    @property
+    def humidity_pct_max(self) -> int | None:
+        """Return daily maximum relative humidity percentage."""
+        return self.hum_pct_max or self.hum_daily_max
+
+    @property
+    def humidity_pct_min(self) -> int | None:
+        """Return daily minimum relative humidity percentage."""
+        return self.hum_pct_min or self.hum_daily_min
+
 
 class RainPointPoolSensor(HomgarSubDevice):
     """RainPoint pool temperature sensor."""
@@ -530,11 +667,14 @@ class RainPointPoolSensor(HomgarSubDevice):
         super().__init__(**kwargs)
         self.water_temp_c: float | None = None
         self.temp_mk_current: int | None = None
+        self.temp_mk_daily_max: int | None = None
+        self.temp_mk_daily_min: int | None = None
         self.water_temp_f: float | None = None
         self.battery_level: int | None = None
         self.raw_status: str | None = None
         self.trend_raw: int | None = None
         self.battery_state: str | None = None
+        self.signal_strength: int | None = None
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Decode the raw payload using the product model definitions."""
@@ -552,16 +692,42 @@ class RainPointPoolSensor(HomgarSubDevice):
                 self.temp_mk_current = _celsius_to_mk(temp_c)
             if (temp_f := vals.get("temperature_f")) is not None:
                 self.water_temp_f = temp_f
+            if (temp_stats_raw := vals.get("MAX_TEM")) is not None:
+                stats_int = int(temp_stats_raw)
+                max_f = (stats_int >> 16) & 0xFFFF
+                min_f = stats_int & 0xFFFF
+                self.temp_mk_daily_max = _temp_to_mk(max_f)
+                self.temp_mk_daily_min = _temp_to_mk(min_f)
             if (battery_raw := vals.get("battery_state_raw")) is not None:
-                self.battery_level = int(battery_raw)
+                raw_value = int(battery_raw)
+                self.battery_level = {1: 100, 2: 50, 3: 0}.get(raw_value, raw_value)
             if "battery_state" in vals:
                 self.battery_state = vals["battery_state"]
+            if (signal := vals.get("signal_strength")) is not None:
+                strength = _convert_signal_strength(signal)
+                self.signal_strength = strength
+                self.rf_rssi = strength
             if (trend := vals.get("trend_raw")) is not None:
                 self.trend_raw = int(trend)
             self.raw_status = value
             return
 
         self.raw_status = value
+
+    @property
+    def water_temperature_c(self) -> float | None:
+        """Return current pool water temperature in Celsius."""
+        return self.water_temp_c
+
+    @property
+    def water_temperature_c_max(self) -> float | None:
+        """Return daily maximum pool water temperature in Celsius."""
+        return _mk_to_celsius(self.temp_mk_daily_max)
+
+    @property
+    def water_temperature_c_min(self) -> float | None:
+        """Return daily minimum pool water temperature in Celsius."""
+        return _mk_to_celsius(self.temp_mk_daily_min)
 
 
 class RainPoint2ZoneTimer(HomgarSubDevice):

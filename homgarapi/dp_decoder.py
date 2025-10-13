@@ -29,6 +29,9 @@ _DP_SPECS_BY_MODEL: dict[int, dict[int, Mapping[str, Any]]] = {
     model_code: {int(entry["dpCode"]): entry["specs"] for entry in model.get("dp", [])}
     for model_code, model in _PRODUCT_MODELS.items()
 }
+_DP_OVERRIDES: dict[int, dict[int, str]] = {
+    268: {10: "signal_strength"},
+}
 
 
 def _strip_prefix(value: str) -> tuple[bytes, bool]:
@@ -123,15 +126,20 @@ def decode_status_payload(
     for dp_code, raw in items:
         specs = specs_map.get(dp_code)
         identity = specs.get("identity") if specs else None
+        override_identity = _DP_OVERRIDES.get(model_code, {}).get(dp_code)
+        if override_identity:
+            identity = override_identity
 
-        if not specs or not identity:
+        if not identity:
             decoded[f"dp_{dp_code}"] = raw
             continue
 
-        data_type = specs.get("dataType")
+        data_type = specs.get("dataType") if specs else None
 
         processed: Any
-        if data_type == 1 and raw:
+        if identity == "signal_strength":
+            processed = int.from_bytes(raw or b"\x00", byteorder="little", signed=False)
+        elif data_type == 1 and raw and specs:
             processed = _decode_numeric(raw, specs)
         elif data_type == 2 and raw:
             processed = int.from_bytes(raw, byteorder="little", signed=False)
