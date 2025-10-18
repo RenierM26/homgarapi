@@ -30,6 +30,11 @@ _DP_SPECS_BY_MODEL: dict[int, dict[int, Mapping[str, Any]]] = {
     for model_code, model in _PRODUCT_MODELS.items()
 }
 _DP_OVERRIDES: dict[int, dict[int, str]] = {
+    87: {
+        4: "STA_HOUR_RAIN",
+        5: "STA_DAY_RAIN",
+        6: "STA_7DAY_RAIN",
+    },
     268: {10: "signal_strength"},
 }
 
@@ -153,6 +158,12 @@ def decode_status_payload(
                 decoded["temperature_c"] = round((temp_f - 32.0) * 5.0 / 9.0, 1)
             else:
                 decoded["temperature_c"] = temp_f
+        elif identity in {"STA_HOUR_RAIN", "STA_DAY_RAIN", "STA_7DAY_RAIN"}:
+            if isinstance(processed, bytes):
+                processed_value = int.from_bytes(processed, byteorder="little", signed=False)
+            else:
+                processed_value = int(processed)
+            decoded[identity] = processed_value
         elif identity == "STA_RH":
             decoded["humidity_pct"] = processed
         elif identity == "STA_ILLUMINANCE":

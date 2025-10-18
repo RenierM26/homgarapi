@@ -18,8 +18,6 @@ from .devices import MODEL_CODE_MAPPING, HomgarDevice, HomgarHome, HomgarHubDevi
 from .logutil import TRACE, get_logger
 
 logger = get_logger(__file__)
-
-
 class HomgarApiException(Exception):
     """Raised when the HomGar API returns a non-success response."""
 
@@ -33,8 +31,6 @@ class HomgarApiException(Exception):
         """Return a readable representation of the error."""
         base = f"HomGar API returned code {self.code}"
         return f"{base} ('{self.message}')" if self.message else base
-
-
 class HomgarApi:
     """Thin client around the HomGar REST endpoints."""
 
@@ -54,7 +50,10 @@ class HomgarApi:
         self.cache: MutableMapping[str, Any] = auth_cache or {}
         self.base = api_base_url.rstrip("/")
         self._auth_manager = AuthRetryManager(policy=AuthRetryPolicy())
-        self._unknown_devices: list[Mapping[str, Any]] = []
+        self._unknown_devices: dict[
+            tuple[str | None, str | None, str | None], dict[str, Any]
+        ] = {}
+        self._unknown_device_status: dict[tuple[str | None, str], list[str]] = {}
 
     def _request(
         self,
@@ -116,6 +115,11 @@ class HomgarApi:
         return cast(
             Mapping[str, Any], self._get_json("/app/common/core/productModel/json")
         )
+
+    def get_dictionary(self) -> Mapping[str, Any]:
+        """Retrieve platform dictionary metadata (currency, soil types, etc.)."""
+        data = self._get_json("/app/common/core/dict")
+        return cast(Mapping[str, Any], data or {})
 
     def login(self, email: str, password: str, area_code: str = "31") -> None:
         """Perform a login and cache the resulting tokens.
@@ -207,7 +211,9 @@ class HomgarApi:
                 if subdevice_class is None:
                     self._record_unknown_device(subdevice_data)
                     continue
-                subdevices.append(subdevice_class(**device_base_props(subdevice_data)))
+                subdevice = subdevice_class(**device_base_props(subdevice_data))
+                self._enrich_device_metadata(subdevice, subdevice_data)
+                subdevices.append(subdevice)
 
             hub_class = get_device_class(hub_data)
             if hub_class is not None and issubclass(hub_class, HomgarHubDevice):
@@ -221,6 +227,7 @@ class HomgarApi:
                     subdevices=subdevices,
                 )
                 self._record_unknown_device(hub_data)
+            self._enrich_device_metadata(hub_instance, hub_data)
             hubs.append(hub_instance)
 
         return hubs
@@ -289,6 +296,7 @@ class HomgarApi:
                 or id_map.get(status_key.lower())
             )
             if matched_device is None:
+                self._record_unknown_status(hub, status_key, subdevice_status)
                 logger.debug(
                     "Unmatched status entry for hub %s (%s): id=%s payload=%s",
                     getattr(hub, "name", hub.mid),
@@ -362,18 +370,111 @@ class HomgarApi:
 
     def get_unknown_devices(self) -> list[Mapping[str, Any]]:
         """Return all device payloads that could not be classified."""
-        return list(self._unknown_devices)
+        result: list[Mapping[str, Any]] = []
+        for key, payload in self._unknown_devices.items():
+            mid_str, did_str, addr_str = key
+            candidate_keys: list[tuple[str | None, str]] = []
+            if mid_str is not None and did_str is not None:
+                candidate_keys.append((mid_str, did_str.upper()))
+            if mid_str is not None and addr_str is not None:
+                try:
+                    addr_int = int(addr_str)
+                except (TypeError, ValueError):
+                    formatted_addr: str | None = None
+                    if isinstance(addr_str, str) and addr_str.upper().startswith("D"):
+                        formatted_addr = addr_str.upper()
+                    else:
+                        formatted_addr = None
+                    if formatted_addr is not None:
+                        candidate_keys.append((mid_str, formatted_addr))
+                    elif isinstance(addr_str, str):
+                        candidate_keys.append((mid_str, addr_str.upper()))
+                else:
+                    candidate_keys.append((mid_str, f"D{addr_int:02d}"))
+                    candidate_keys.append((mid_str, f"D{addr_int}"))
+                    candidate_keys.append((mid_str, str(addr_str).upper()))
+            status_values: list[str] = []
+            for candidate in candidate_keys:
+                values = self._unknown_device_status.get(candidate)
+                if values:
+                    for value in values:
+                        if value not in status_values:
+                            status_values.append(value)
+            enriched = dict(payload)
+            if status_values:
+                enriched["status_values"] = status_values
+            result.append(enriched)
+        return result
 
     def _record_unknown_device(self, payload: Mapping[str, Any]) -> None:
         """Record a device payload that lacks a known model mapping."""
-        self._unknown_devices.append(dict(payload))
+        key = self._build_unknown_device_key(payload)
+        existing = self._unknown_devices.get(key)
+        payload_copy = dict(payload)
+        if existing is not None:
+            existing.update(payload_copy)
+        else:
+            self._unknown_devices[key] = payload_copy
         logger.warning(
             "Encountered unsupported device (model=%s, modelCode=%s).",
             payload.get("model"),
             payload.get("modelCode"),
         )
 
+    def _enrich_device_metadata(
+        self, device: HomgarDevice, payload: Mapping[str, Any]
+    ) -> None:
+        """Populate additional metadata on device objects when available."""
+        mac = payload.get("mac")
+        if isinstance(mac, str) and mac:
+            setattr(device, "mac", mac)
+        soft_ver = payload.get("softVer")
+        if isinstance(soft_ver, str) and soft_ver:
+            setattr(device, "soft_version", soft_ver)
 
+    def _build_unknown_device_key(
+        self, payload: Mapping[str, Any]
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return a stable key for an unknown device payload."""
+        mid_raw = payload.get("mid")
+        did_raw = payload.get("did")
+        addr_raw = payload.get("addr")
+        return (
+            self._stringify_identifier(mid_raw),
+            self._stringify_identifier(did_raw),
+            self._stringify_identifier(addr_raw),
+        )
+
+    @staticmethod
+    def _stringify_identifier(value: Any) -> str | None:
+        """Coerce identifiers to string form for dictionary keys."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        try:
+            return str(int(value))
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _record_unknown_status(
+        self,
+        hub: HomgarHubDevice,
+        status_key: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Track raw status payloads for devices without model mappings."""
+        value = payload.get("value")
+        if not isinstance(value, str):
+            return
+        mid = getattr(hub, "mid", None)
+        mid_str = self._stringify_identifier(mid)
+        status_norm = status_key.strip().upper()
+        key = (mid_str, status_norm)
+        values = self._unknown_device_status.setdefault(key, [])
+        if value not in values:
+            values.append(value)
 def load_product_models(
     path: str | os.PathLike[str] | None = None,
 ) -> Mapping[int, Mapping[str, Any]]:

@@ -127,8 +127,14 @@ def main() -> None:
     try:
         api = HomgarApi(cache)
         demo(api, config_mapping)
-        unknown_devices = api.get_unknown_devices()
-        if unknown_devices:
+        unknown_devices_raw = api.get_unknown_devices()
+        if unknown_devices_raw:
+            unknown_devices: list[dict[str, Any]] = []
+            for device in unknown_devices_raw:
+                enriched = dict(device)
+                if status_values := enriched.pop("status_values", None):
+                    enriched["status_payloads"] = status_values
+                unknown_devices.append(enriched)
             output_path = args.unknown_output or cache_file.with_name(
                 "unknown_devices.yaml"
             )
