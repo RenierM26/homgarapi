@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, cast
 
 import requests
@@ -331,7 +332,6 @@ class HomgarApi:
         max_retries: int | None = None,
     ) -> None:
         """Ensure a valid session exists with retry/backoff behaviour."""
-        now = datetime.now(tz=UTC).timestamp()
         policy = self._auth_manager.policy
         original_max = policy.max_retries
         if max_retries is not None:
@@ -350,14 +350,56 @@ class HomgarApi:
                 return HomgarApiException(-1, wait_msg)
             return HomgarApiException(-1, reason)
 
+        attempt_limit = max(1, policy.max_retries)
+        attempt_count = 0
+        last_error: HomgarApiException | None = None
+        success = False
+
         try:
-            self._auth_manager.execute(
-                attempt_ts=now,
-                func=attempt,
-                wrap_exception=wrap,
-            )
+            while attempt_count < attempt_limit:
+                attempt_count += 1
+                attempt_ts = datetime.now(tz=UTC).timestamp()
+                try:
+                    self._auth_manager.execute(
+                        attempt_ts=attempt_ts,
+                        func=attempt,
+                        wrap_exception=wrap,
+                    )
+                    success = True
+                    if attempt_count > 1:
+                        logger.debug(
+                            "Successfully logged in to HomGar API after %d attempts",
+                            attempt_count,
+                        )
+                    break
+                except HomgarApiException as err:
+                    last_error = err
+                    error_code = getattr(err, "code", None)
+                    error_message = str(getattr(err, "message", "")).lower()
+                    if error_code == "invalid_auth":
+                        raise
+                    if "too many login failures" in error_message:
+                        break
+                    if attempt_count >= attempt_limit:
+                        break
+                    backoff = min(
+                        float(policy.max_backoff),
+                        float(policy.min_backoff) * (2 ** (attempt_count - 1)),
+                    )
+                    logger.debug(
+                        "Login attempt %d/%d failed (%s); retrying in %.1fs",
+                        attempt_count,
+                        attempt_limit,
+                        err,
+                        backoff,
+                    )
+                    time.sleep(backoff)
         finally:
             policy.max_retries = original_max
+        if not success:
+            if last_error is not None:
+                raise last_error
+            raise HomgarApiException(-1, "login_failed")
         logger.debug("Successfully logged in to HomGar API")
 
     def health_check(self) -> bool:
