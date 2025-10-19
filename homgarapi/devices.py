@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import re
 from typing import Any, ClassVar, Final
@@ -17,6 +18,39 @@ STATS_VALUE_REGEX: Final[re.Pattern[str]] = re.compile(r"^(\d+)\((\d+)/(\d+)/(\d
 _LOGGER = get_logger(__file__)
 
 
+@dataclass(frozen=True)
+class DeviceSensorMapping:
+    """Mapping between a sensor key and the function providing its value."""
+
+    key: str
+    value_fn: Callable[[Any], Any]
+    allow_none: bool = True
+
+    def is_available(self, device: Any) -> bool:
+        """Return True if the sensor has data available on the device."""
+        try:
+            value = self.value_fn(device)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+        return value is not None or self.allow_none
+
+
+def attr_mapping(
+    key: str,
+    *,
+    attr: str | None = None,
+    allow_none: bool = True,
+) -> DeviceSensorMapping:
+    """Build a device sensor mapping backed by a simple attribute lookup."""
+
+    attr_name = attr or key
+
+    def _lookup(device: Any) -> Any:
+        return getattr(device, attr_name, None)
+
+    return DeviceSensorMapping(key, _lookup, allow_none=allow_none)
+
+
 def _convert_signal_strength(raw: float) -> int:
     """Convert signal strength readings to signed dBm values when required."""
     try:
@@ -27,6 +61,22 @@ def _convert_signal_strength(raw: float) -> int:
     if value > 127:
         return value - 256
     return value
+
+
+def _safe_int(value: Any) -> int | None:
+    """Return ``int(value)`` or ``None`` if conversion fails."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    """Return ``float(value)`` or ``None`` if conversion fails."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _mk_to_celsius(value: int | None) -> float | None:
@@ -61,6 +111,18 @@ def _celsius_to_mk(value: float) -> int:
     return round((value + 273.15) * 1000)
 
 
+def _decode_packed_fahrenheit_extrema(raw_value: int | str | None) -> tuple[int | None, int | None]:
+    """Decode packed Fahrenheit extrema into millikelvin maxima and minima."""
+    if raw_value is None:
+        return (None, None)
+    packed = _safe_int(raw_value)
+    if packed is None:
+        return (None, None)
+    max_f = (packed >> 16) & 0xFFFF
+    min_f = packed & 0xFFFF
+    return (_temp_to_mk(max_f), _temp_to_mk(min_f))
+
+
 class HomgarHome:
     """Representation of a HomGar home."""
 
@@ -77,6 +139,8 @@ class HomgarDevice:
     """Base class for HomGar devices."""
 
     FRIENDLY_DESC: ClassVar[str] = "Unknown HomGar device"
+    INCLUDE_BASE_TEMPERATURE: ClassVar[bool] = True
+    INCLUDE_BASE_HUMIDITY: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -109,6 +173,7 @@ class HomgarDevice:
 
         self.address: int | None = None
         self.rf_rssi: int | None = None
+        self.updated_in_last_poll: bool = False
 
     def __str__(self) -> str:
         """Return a human readable description."""
@@ -176,6 +241,72 @@ class HomgarDevice:
         """Parse the device-specific section of the payload."""
         raise NotImplementedError
 
+    def _decode_tlv_payload(
+        self,
+        value: str,
+        *,
+        model_code: int,
+        log_label: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Decode a TLV payload, updating status fields and returning values."""
+        if not value.startswith(("10#", "11#")):
+            return None
+
+        decoded = decode_status_payload(value, model_code=model_code)
+        vals = decoded.values
+        self.status_fields.update(vals)
+
+        if hasattr(self, "raw_status"):
+            setattr(self, "raw_status", value)
+
+        if log_label:
+            _LOGGER.debug("Decoded %s payload for %s: %s", log_label, self.did, vals)
+
+        return vals
+
+    def _update_signal_strength(self, value: Any) -> None:
+        """Update signal strength attributes from a raw reading."""
+        strength = _safe_int(value)
+        if strength is None:
+            return
+        converted = _convert_signal_strength(strength)
+        self.rf_rssi = converted
+        if hasattr(self, "signal_strength"):
+            setattr(self, "signal_strength", converted)
+
+    def iter_sensor_mappings(self) -> Iterable[DeviceSensorMapping]:
+        """Return sensor mappings for common device metrics."""
+        if self.rf_rssi is not None:
+            yield attr_mapping("rf_rssi", allow_none=False)
+
+        if self.INCLUDE_BASE_TEMPERATURE and hasattr(type(self), "temperature_c"):
+            yield attr_mapping("temperature", attr="temperature_c")
+
+        if self.INCLUDE_BASE_HUMIDITY and hasattr(type(self), "humidity_pct"):
+            yield attr_mapping("humidity", attr="humidity_pct")
+
+        if getattr(self, "HAS_BATTERY", True):
+            if hasattr(self, "battery_level"):
+                yield attr_mapping(
+                    "battery",
+                    attr="battery_level",
+                    allow_none=False,
+                )
+            if hasattr(self, "battery_state"):
+                yield attr_mapping(
+                    "battery_state",
+                    attr="battery_state",
+                    allow_none=False,
+                )
+
+        if self.last_seen_ts is not None:
+            yield DeviceSensorMapping(
+                "last_seen",
+                lambda dev: datetime.fromtimestamp(dev.last_seen_ts, tz=UTC)
+                if getattr(dev, "last_seen_ts", None) is not None
+                else None,
+            )
+
 
 class HomgarHubDevice(HomgarDevice):
     """A hub acts as a gateway for sensors and actuators."""
@@ -226,6 +357,8 @@ class RainPointDisplayHub(HomgarHubDevice):
     MODEL_CODES: ClassVar[list[int]] = [264]
     FRIENDLY_DESC: ClassVar[str] = "Irrigation Display Hub"
     HAS_BATTERY: ClassVar[bool] = False
+    INCLUDE_BASE_TEMPERATURE: ClassVar[bool] = False
+    INCLUDE_BASE_HUMIDITY: ClassVar[bool] = False
 
     def __init__(self, **kwargs: Any) -> None:
         """Initialise placeholder attributes for the display hub."""
@@ -337,6 +470,12 @@ class RainPointDisplayHub(HomgarHubDevice):
         """Return daily minimum relative humidity percentage."""
         return self.hum_daily_min
 
+    def iter_sensor_mappings(self) -> Iterable[DeviceSensorMapping]:
+        """Return sensor mappings exposed by the display hub."""
+        yield from super().iter_sensor_mappings()
+        yield attr_mapping("pressure", attr="press_pa_current")
+        yield attr_mapping("wifi_rssi", attr="wifi_rssi", allow_none=False)
+
 
 class RainPointGatewayHub(HomgarHubDevice):
     """RainPoint gateway hub used by newer hardware revisions."""
@@ -344,6 +483,8 @@ class RainPointGatewayHub(HomgarHubDevice):
     MODEL_CODES: ClassVar[list[int]] = [273, 289]
     FRIENDLY_DESC: ClassVar[str] = "RainPoint Gateway Hub"
     HAS_BATTERY: ClassVar[bool] = False
+    INCLUDE_BASE_TEMPERATURE: ClassVar[bool] = False
+    INCLUDE_BASE_HUMIDITY: ClassVar[bool] = False
 
     def __init__(self, **kwargs: Any) -> None:
         """Initialise placeholder attributes for the gateway hub."""
@@ -372,12 +513,25 @@ class RainPointGatewayHub(HomgarHubDevice):
         else:
             super().set_device_status(api_obj)
 
+    def iter_sensor_mappings(self) -> Iterable[DeviceSensorMapping]:
+        """Return sensor mappings exposed by the gateway hub."""
+        yield from super().iter_sensor_mappings()
+        yield attr_mapping("wifi_rssi", attr="wifi_rssi", allow_none=False)
+        yield DeviceSensorMapping(
+            "battery_state",
+            lambda dev: dev.status_fields.get("battery_state")
+            if getattr(dev, "status_fields", None)
+            else None,
+            allow_none=False,
+        )
+
 
 class RainPointSoilMoistureSensor(HomgarSubDevice):
     """RainPoint soil moisture sensor."""
 
     MODEL_CODES: ClassVar[list[int]] = [72]
     FRIENDLY_DESC: ClassVar[str] = "Soil Moisture Sensor"
+    INCLUDE_BASE_HUMIDITY: ClassVar[bool] = False
 
     def __init__(self, **kwargs: Any) -> None:
         """Initialise placeholder attributes for the soil sensor."""
@@ -392,30 +546,23 @@ class RainPointSoilMoistureSensor(HomgarSubDevice):
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Parse the soil moisture payload into temperature, soil, and light readings."""
-        if value.startswith(("10#", "11#")):
-            decoded = decode_status_payload(value, model_code=72)
-            vals = decoded.values
-            self.status_fields.update(vals)
-            _LOGGER.debug(
-                "Decoded soil payload for %s: %s",
-                self.did,
-                vals,
-            )
+        if (vals := self._decode_tlv_payload(
+            value,
+            model_code=72,
+            log_label="soil",
+        )) is not None:
             if (temp_c := vals.get("temperature_c")) is not None:
                 self.temp_mk_current = _celsius_to_mk(temp_c)
             if (moist := vals.get("humidity_pct")) is not None:
-                self.moist_percent_current = int(moist)
+                self.moist_percent_current = _safe_int(moist)
             if (lux := vals.get("illuminance_lux")) is not None:
-                self.light_lux_current = float(lux)
+                self.light_lux_current = _safe_float(lux)
             if (battery_raw := vals.get("battery_state_raw")) is not None:
-                self.battery_level_raw = int(battery_raw)
+                self.battery_level_raw = _safe_int(battery_raw)
             if "battery_state" in vals:
                 self.battery_state = vals["battery_state"]
             if (rssi := vals.get("signal_strength")) is not None:
-                strength = _convert_signal_strength(rssi)
-                self.signal_strength = strength
-                self.rf_rssi = strength
-            self.raw_status = value
+                self._update_signal_strength(rssi)
             return
 
         temp_str, moist_str, light_str = value.split(",")
@@ -448,12 +595,20 @@ class RainPointSoilMoistureSensor(HomgarSubDevice):
             return False
         return super().supports_sensor(sensor_key)
 
+    def iter_sensor_mappings(self) -> Iterable[DeviceSensorMapping]:
+        """Return sensor mappings exposed by the soil sensor."""
+        yield from super().iter_sensor_mappings()
+        yield attr_mapping("soil_moisture", attr="moist_percent_current")
+        yield attr_mapping("light", attr="light_lux_current")
+
 
 class RainPointRainSensor(HomgarSubDevice):
     """RainPoint rainfall sensor."""
 
     MODEL_CODES: ClassVar[list[int]] = [87]
     FRIENDLY_DESC: ClassVar[str] = "High Precision Rain Sensor"
+    INCLUDE_BASE_TEMPERATURE: ClassVar[bool] = False
+    INCLUDE_BASE_HUMIDITY: ClassVar[bool] = False
 
     def __init__(self, **kwargs: Any) -> None:
         """Initialise placeholder attributes for the rain sensor."""
@@ -469,50 +624,32 @@ class RainPointRainSensor(HomgarSubDevice):
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Parse the rainfall payload into rolling accumulation metrics."""
-        if value.startswith(("10#", "11#")):
-            decoded = decode_status_payload(value, model_code=87)
-            vals = decoded.values
-            self.status_fields.update(vals)
+        if (vals := self._decode_tlv_payload(
+            value,
+            model_code=87,
+            log_label="rain",
+        )) is not None:
+            def _scaled(name: str) -> float | None:
+                measured = _safe_float(vals.get(name))
+                return measured * 0.1 if measured is not None else None
 
-            def _get_float(name: str) -> float | None:
-                raw_val = vals.get(name)
-                if raw_val is None:
-                    return None
-                try:
-                    return float(raw_val)
-                except (TypeError, ValueError):
-                    return None
-
-            if (total := _get_float("STA_TOTAL_RAIN")) is not None:
-                self.rainfall_mm_total = total * 0.1
-            if (hour := _get_float("STA_HOUR_RAIN")) is not None:
-                self.rainfall_mm_hour = hour * 0.1
-            if (daily := _get_float("STA_DAY_RAIN")) is not None:
-                self.rainfall_mm_daily = daily * 0.1
-            if (seven_day := _get_float("STA_7DAY_RAIN")) is not None:
-                self.rainfall_mm_7days = seven_day * 0.1
+            if (total := _scaled("STA_TOTAL_RAIN")) is not None:
+                self.rainfall_mm_total = total
+            if (hour := _scaled("STA_HOUR_RAIN")) is not None:
+                self.rainfall_mm_hour = hour
+            if (daily := _scaled("STA_DAY_RAIN")) is not None:
+                self.rainfall_mm_daily = daily
+            if (seven_day := _scaled("STA_7DAY_RAIN")) is not None:
+                self.rainfall_mm_7days = seven_day
 
             if (signal := vals.get("signal_strength")) is not None:
-                try:
-                    signal_int = _convert_signal_strength(signal)
-                except (TypeError, ValueError):
-                    signal_int = None
-                self.rf_rssi = signal_int
-                self.signal_strength = signal_int
+                self._update_signal_strength(signal)
 
             if (battery_raw := vals.get("battery_state_raw")) is not None:
-                try:
-                    self.battery_level_raw = int(battery_raw)
-                except (TypeError, ValueError):
-                    self.battery_level_raw = None
+                self.battery_level_raw = _safe_int(battery_raw)
             if "battery_state" in vals:
                 battery_state = vals["battery_state"]
-                if isinstance(battery_state, str):
-                    self.battery_state = battery_state
-                else:
-                    self.battery_state = str(battery_state)
-
-            self.raw_status = value
+                self.battery_state = str(battery_state) if battery_state is not None else None
             return
 
         total, hour, daily, seven_day = _parse_stats_value(value[2:])
@@ -542,6 +679,14 @@ class RainPointRainSensor(HomgarSubDevice):
             return False
         return super().supports_sensor(sensor_key)
 
+    def iter_sensor_mappings(self) -> Iterable[DeviceSensorMapping]:
+        """Return sensor mappings exposed by the rain sensor."""
+        yield from super().iter_sensor_mappings()
+        yield attr_mapping("rainfall_total", attr="rainfall_mm_total")
+        yield attr_mapping("rainfall_hourly", attr="rainfall_mm_hour")
+        yield attr_mapping("rainfall_daily", attr="rainfall_mm_daily")
+        yield attr_mapping("rainfall_weekly", attr="rainfall_mm_7days")
+
 
 class RainPointAirSensor(HomgarSubDevice):
     """RainPoint outdoor air sensor."""
@@ -570,42 +715,39 @@ class RainPointAirSensor(HomgarSubDevice):
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Parse the air sensor payload into temperature and humidity statistics."""
-        if value.startswith(("10#", "11#")):
-            decoded = decode_status_payload(value, model_code=262)
-            vals = decoded.values
-            self.status_fields.update(vals)
-            _LOGGER.debug(
-                "Decoded air payload for %s: %s",
-                self.did,
-                vals,
-            )
-            if (temp_stats_raw := vals.get("MAX_TEM")) is not None:
-                stats_int = int(temp_stats_raw)
-                max_f = (stats_int >> 16) & 0xFFFF
-                min_f = stats_int & 0xFFFF
-                self.temp_mk_daily_max = _temp_to_mk(max_f)
-                self.temp_mk_daily_min = _temp_to_mk(min_f)
-                self.temp_c_max = _mk_to_celsius(self.temp_mk_daily_max)
-                self.temp_c_min = _mk_to_celsius(self.temp_mk_daily_min)
-            if (temp_c := vals.get("temperature_c")) is not None:
+        if (vals := self._decode_tlv_payload(
+            value,
+            model_code=262,
+            log_label="air",
+        )) is not None:
+            max_mk, min_mk = _decode_packed_fahrenheit_extrema(vals.get("MAX_TEM"))
+            if max_mk is not None:
+                self.temp_mk_daily_max = max_mk
+                self.temp_c_max = _mk_to_celsius(max_mk)
+            if min_mk is not None:
+                self.temp_mk_daily_min = min_mk
+                self.temp_c_min = _mk_to_celsius(min_mk)
+
+            if (temp_c := _safe_float(vals.get("temperature_c"))) is not None:
                 self.temp_mk_current = _celsius_to_mk(temp_c)
                 self.temp_c_max = self.temp_c_max or temp_c
                 self.temp_c_min = self.temp_c_min or temp_c
-            if (humidity := vals.get("humidity_pct")) is not None:
-                self.hum_current = int(humidity)
+
+            if (humidity := _safe_int(vals.get("humidity_pct"))) is not None:
+                self.hum_current = humidity
                 self.hum_pct_max = self.hum_pct_max or self.hum_current
                 self.hum_pct_min = self.hum_pct_min or self.hum_current
-            if (humidity_stats := vals.get("MAX_RH")) is not None:
-                stats_int = int(humidity_stats)
-                self.hum_daily_max = (stats_int >> 8) & 0xFF
-                self.hum_daily_min = stats_int & 0xFF
+
+            if (humidity_stats := _safe_int(vals.get("MAX_RH"))) is not None:
+                self.hum_daily_max = (humidity_stats >> 8) & 0xFF
+                self.hum_daily_min = humidity_stats & 0xFF
                 self.hum_pct_max = self.hum_daily_max
                 self.hum_pct_min = self.hum_daily_min
-            if (battery_raw := vals.get("battery_state_raw")) is not None:
-                self.battery_level_raw = int(battery_raw)
+
+            if (battery_raw := _safe_int(vals.get("battery_state_raw"))) is not None:
+                self.battery_level_raw = battery_raw
             if "battery_state" in vals:
                 self.battery_state = vals["battery_state"]
-            self.raw_status = value
             return
 
         temp_str, hum_str, *_ = value.split(",")
@@ -662,6 +804,14 @@ class RainPointAirSensor(HomgarSubDevice):
         """Return daily minimum relative humidity percentage."""
         return self.hum_pct_min or self.hum_daily_min
 
+    def iter_sensor_mappings(self) -> Iterable[DeviceSensorMapping]:
+        """Return sensor mappings exposed by the air sensor."""
+        yield from super().iter_sensor_mappings()
+        yield attr_mapping("temperature_max", attr="temperature_c_max")
+        yield attr_mapping("temperature_min", attr="temperature_c_min")
+        yield attr_mapping("humidity_max", attr="humidity_pct_max")
+        yield attr_mapping("humidity_min", attr="humidity_pct_min")
+
 
 class RainPointCO2Sensor(HomgarSubDevice):
     """RainPoint CO₂ sensor."""
@@ -684,31 +834,20 @@ class RainPointCO2Sensor(HomgarSubDevice):
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Decode TLV payload with CO₂, temperature and humidity measurements."""
-        if value.startswith(("10#", "11#")):
-            decoded = decode_status_payload(value, model_code=89)
-            vals = decoded.values
-            self.status_fields.update(vals)
-            _LOGGER.debug("Decoded CO₂ payload for %s: %s", self.did, vals)
+        if (vals := self._decode_tlv_payload(
+            value,
+            model_code=89,
+            log_label="CO₂",
+        )) is not None:
+            if (co2_int := _safe_int(vals.get("STA_CO2"))) is not None:
+                self.co2_ppm = co2_int & 0xFFFF
+                self.co2_alert_ppm = (co2_int >> 16) & 0xFFFF
+                self.status_fields["co2_ppm"] = self.co2_ppm
+                self.status_fields["co2_alert_ppm"] = self.co2_alert_ppm
 
-            if (co2_raw := vals.get("STA_CO2")) is not None:
-                try:
-                    co2_int = int(co2_raw)
-                except (TypeError, ValueError):
-                    co2_int = None
-                if co2_int is not None:
-                    self.co2_ppm = co2_int & 0xFFFF
-                    self.co2_alert_ppm = (co2_int >> 16) & 0xFFFF
-                    self.status_fields["co2_ppm"] = self.co2_ppm
-                    self.status_fields["co2_alert_ppm"] = self.co2_alert_ppm
-
-            if (co2_limits := vals.get("MAX_CO2")) is not None:
-                try:
-                    limits_int = int(co2_limits)
-                except (TypeError, ValueError):
-                    limits_int = None
-                if limits_int is not None:
-                    self.co2_max_ppm = limits_int & 0xFFFF
-                    self.co2_min_ppm = (limits_int >> 16) & 0xFFFF
+            if (limits_int := _safe_int(vals.get("MAX_CO2"))) is not None:
+                self.co2_max_ppm = limits_int & 0xFFFF
+                self.co2_min_ppm = (limits_int >> 16) & 0xFFFF
             elif (
                 (co2_bytes := vals.get("dp_8"))
                 and isinstance(co2_bytes, bytes)
@@ -716,32 +855,20 @@ class RainPointCO2Sensor(HomgarSubDevice):
             ):
                 self.co2_min_ppm = int.from_bytes(co2_bytes[0:2], "little")
                 self.co2_max_ppm = int.from_bytes(co2_bytes[2:4], "little")
+
             if self.co2_min_ppm is not None:
                 self.status_fields["co2_min_ppm"] = self.co2_min_ppm
             if self.co2_max_ppm is not None:
                 self.status_fields["co2_max_ppm"] = self.co2_max_ppm
 
-            if (temp_c := vals.get("temperature_c")) is not None:
-                try:
-                    temp_float = float(temp_c)
-                except (TypeError, ValueError):
-                    temp_float = None
-                if temp_float is not None:
-                    self.temp_mk_current = _celsius_to_mk(temp_float)
-            if (humidity := vals.get("humidity_pct")) is not None:
-                try:
-                    self.hum_current = int(humidity)
-                except (TypeError, ValueError):
-                    self.hum_current = None
-            if (battery_raw := vals.get("battery_state_raw")) is not None:
-                try:
-                    self.battery_level_raw = int(battery_raw)
-                except (TypeError, ValueError):
-                    self.battery_level_raw = None
+            if (temp_c := _safe_float(vals.get("temperature_c"))) is not None:
+                self.temp_mk_current = _celsius_to_mk(temp_c)
+            if (humidity := _safe_int(vals.get("humidity_pct"))) is not None:
+                self.hum_current = humidity
+            if (battery_raw := _safe_int(vals.get("battery_state_raw"))) is not None:
+                self.battery_level_raw = battery_raw
             if "battery_state" in vals:
                 self.battery_state = vals["battery_state"]
-
-            self.raw_status = value
             return
 
         self.raw_status = value
@@ -761,6 +888,14 @@ class RainPointCO2Sensor(HomgarSubDevice):
         if sensor_key.startswith("co2"):
             return True
         return super().supports_sensor(sensor_key)
+
+    def iter_sensor_mappings(self) -> Iterable[DeviceSensorMapping]:
+        """Return sensor mappings exposed by the CO₂ sensor."""
+        yield from super().iter_sensor_mappings()
+        yield attr_mapping("co2", attr="co2_ppm")
+        yield attr_mapping("co2_min", attr="co2_min_ppm")
+        yield attr_mapping("co2_max", attr="co2_max_ppm")
+        yield attr_mapping("co2_alert", attr="co2_alert_ppm")
 
     def __str__(self) -> str:
         """Return human readable description including CO₂, temperature, humidity."""
@@ -783,6 +918,8 @@ class RainPointPoolSensor(HomgarSubDevice):
 
     MODEL_CODES: ClassVar[list[int]] = [268]
     FRIENDLY_DESC: ClassVar[str] = "Pool Temperature Sensor"
+    INCLUDE_BASE_TEMPERATURE: ClassVar[bool] = False
+    INCLUDE_BASE_HUMIDITY: ClassVar[bool] = False
 
     def __init__(self, **kwargs: Any) -> None:
         """Initialise placeholder attributes for the pool sensor."""
@@ -800,38 +937,31 @@ class RainPointPoolSensor(HomgarSubDevice):
 
     def _parse_device_specific_status_d_value(self, value: str) -> None:
         """Decode the raw payload using the product model definitions."""
-        if value.startswith(("10#", "11#")):
-            decoded = decode_status_payload(value, model_code=268)
-            vals = decoded.values
-            self.status_fields.update(vals)
-            _LOGGER.debug(
-                "Decoded pool payload for %s: %s",
-                self.did,
-                vals,
-            )
-            if (temp_c := vals.get("temperature_c")) is not None:
+        if (vals := self._decode_tlv_payload(
+            value,
+            model_code=268,
+            log_label="pool",
+        )) is not None:
+            if (temp_c := _safe_float(vals.get("temperature_c"))) is not None:
                 self.water_temp_c = temp_c
                 self.temp_mk_current = _celsius_to_mk(temp_c)
-            if (temp_f := vals.get("temperature_f")) is not None:
+            if (temp_f := _safe_float(vals.get("temperature_f"))) is not None:
                 self.water_temp_f = temp_f
-            if (temp_stats_raw := vals.get("MAX_TEM")) is not None:
-                stats_int = int(temp_stats_raw)
-                max_f = (stats_int >> 16) & 0xFFFF
-                min_f = stats_int & 0xFFFF
-                self.temp_mk_daily_max = _temp_to_mk(max_f)
-                self.temp_mk_daily_min = _temp_to_mk(min_f)
-            if (battery_raw := vals.get("battery_state_raw")) is not None:
-                raw_value = int(battery_raw)
-                self.battery_level = {1: 100, 2: 50, 3: 0}.get(raw_value, raw_value)
+
+            max_mk, min_mk = _decode_packed_fahrenheit_extrema(vals.get("MAX_TEM"))
+            if max_mk is not None:
+                self.temp_mk_daily_max = max_mk
+            if min_mk is not None:
+                self.temp_mk_daily_min = min_mk
+
+            if (battery_raw := _safe_int(vals.get("battery_state_raw"))) is not None:
+                self.battery_level = {1: 100, 2: 50, 3: 0}.get(battery_raw, battery_raw)
             if "battery_state" in vals:
                 self.battery_state = vals["battery_state"]
             if (signal := vals.get("signal_strength")) is not None:
-                strength = _convert_signal_strength(signal)
-                self.signal_strength = strength
-                self.rf_rssi = strength
-            if (trend := vals.get("trend_raw")) is not None:
-                self.trend_raw = int(trend)
-            self.raw_status = value
+                self._update_signal_strength(signal)
+            if (trend := _safe_int(vals.get("trend_raw"))) is not None:
+                self.trend_raw = trend
             return
 
         self.raw_status = value
@@ -870,6 +1000,13 @@ class RainPointPoolSensor(HomgarSubDevice):
         if not parts:
             return base
         return f"{base}: {', '.join(parts)}"
+
+    def iter_sensor_mappings(self) -> Iterable[DeviceSensorMapping]:
+        """Return sensor mappings exposed by the pool sensor."""
+        yield from super().iter_sensor_mappings()
+        yield attr_mapping("pool_water_temp", attr="water_temperature_c")
+        yield attr_mapping("pool_water_temp_max", attr="water_temperature_c_max")
+        yield attr_mapping("pool_water_temp_min", attr="water_temperature_c_min")
 
 
 class RainPoint2ZoneTimer(HomgarSubDevice):

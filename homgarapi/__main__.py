@@ -31,7 +31,11 @@ def demo(api: HomgarApi, config: Mapping[str, str]) -> None:
             logger.info("  Hub %s", hub)
             api.get_device_status(hub)
             for subdevice in hub.subdevices:
-                logger.info("    Subdevice %s", subdevice)
+                description = str(subdevice)
+                updated = getattr(subdevice, "updated_in_last_poll", False)
+                if not updated:
+                    description = f"{description} [offline]"
+                logger.info("    Subdevice %s", description)
 
 
 def main() -> None:

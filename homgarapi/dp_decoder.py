@@ -38,6 +38,12 @@ _DP_OVERRIDES: dict[int, dict[int, str]] = {
     268: {10: "signal_strength"},
 }
 
+_BATTERY_STATE_LABELS: dict[int, str] = {
+    1: "normal",
+    2: "low",
+    3: "critical",
+}
+
 
 def _strip_prefix(value: str) -> tuple[bytes, bool]:
     """Strip the leading header (`10#…`) and return bytes + z3 flag."""
@@ -168,13 +174,20 @@ def decode_status_payload(
             decoded["humidity_pct"] = processed
         elif identity == "STA_ILLUMINANCE":
             decoded["illuminance_lux"] = processed
+        elif identity == "STA_CO2":
+            if isinstance(processed, bytes):
+                processed_value = int.from_bytes(
+                    processed,
+                    byteorder="little",
+                    signed=False,
+                )
+            else:
+                processed_value = int(processed)
+            decoded[identity] = processed_value
+            continue
         elif identity == "STA_BAT":
             decoded["battery_state_raw"] = processed
-            decoded["battery_state"] = {
-                1: "normal",
-                2: "low",
-                3: "lack",
-            }.get(processed, processed)
+            decoded["battery_state"] = _BATTERY_STATE_LABELS.get(processed, processed)
         elif identity == "STA_RSSI":
             decoded["signal_strength"] = processed
         elif identity == "STA_TREND":

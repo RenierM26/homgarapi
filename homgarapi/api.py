@@ -279,6 +279,7 @@ class HomgarApi:
 
         id_map: dict[str, HomgarDevice] = {}
         for homgar_device in (hub, *hub.subdevices):
+            homgar_device.updated_in_last_poll = False
             status_ids = list(homgar_device.get_device_status_ids())
             device_did = getattr(homgar_device, "did", None)
             if device_did is not None:
@@ -307,6 +308,7 @@ class HomgarApi:
                 )
                 continue
             matched_device.set_device_status(subdevice_status)
+            matched_device.updated_in_last_poll = True
 
     def ensure_logged_in(
         self, email: str, password: str, area_code: str = "31"
