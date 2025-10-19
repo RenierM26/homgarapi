@@ -290,13 +290,11 @@ class HomgarDevice:
                 yield attr_mapping(
                     "battery",
                     attr="battery_level",
-                    allow_none=False,
                 )
             if hasattr(self, "battery_state"):
                 yield attr_mapping(
                     "battery_state",
                     attr="battery_state",
-                    allow_none=False,
                 )
 
         if self.last_seen_ts is not None:
@@ -408,7 +406,11 @@ class RainPointDisplayHub(HomgarHubDevice):
         Deduced meaning: temperature, humidity, and pressure with day statistics.
         """
 
-        temp_str, hum_str, press_str, *_ = value.split(",")
+        parts = value.split(",")
+        if len(parts) < 3:
+            self.raw_status = value
+            return
+        temp_str, hum_str, press_str = parts[0], parts[1], parts[2]
         temp_stats = _parse_stats_value(temp_str)
         converted_temp = tuple(
             _temp_to_mk(stat) if stat is not None else None for stat in temp_stats
@@ -565,10 +567,23 @@ class RainPointSoilMoistureSensor(HomgarSubDevice):
                 self._update_signal_strength(rssi)
             return
 
-        temp_str, moist_str, light_str = value.split(",")
-        self.temp_mk_current = _temp_to_mk(temp_str)
-        self.moist_percent_current = int(moist_str)
-        self.light_lux_current = int(light_str[2:]) * 0.1
+        parts = value.split(",")
+        if len(parts) < 3:
+            self.raw_status = value
+            return
+        temp_str, moist_str, light_str = parts[0], parts[1], ",".join(parts[2:])
+        try:
+            self.temp_mk_current = _temp_to_mk(temp_str)
+        except (TypeError, ValueError):
+            self.temp_mk_current = None
+        try:
+            self.moist_percent_current = int(moist_str)
+        except (TypeError, ValueError):
+            self.moist_percent_current = None
+        try:
+            self.light_lux_current = float(light_str[2:])
+        except (TypeError, ValueError):
+            self.light_lux_current = None
         self.raw_status = value
 
     def __str__(self) -> str:
@@ -598,7 +613,11 @@ class RainPointSoilMoistureSensor(HomgarSubDevice):
     def iter_sensor_mappings(self) -> Iterable[DeviceSensorMapping]:
         """Return sensor mappings exposed by the soil sensor."""
         yield from super().iter_sensor_mappings()
-        yield attr_mapping("soil_moisture", attr="moist_percent_current")
+        yield attr_mapping(
+            "soil_moisture",
+            attr="moist_percent_current",
+            allow_none=False,
+        )
         yield attr_mapping("light", attr="light_lux_current")
 
 
@@ -750,7 +769,11 @@ class RainPointAirSensor(HomgarSubDevice):
                 self.battery_state = vals["battery_state"]
             return
 
-        temp_str, hum_str, *_ = value.split(",")
+        parts = value.split(",")
+        if len(parts) < 2:
+            self.raw_status = value
+            return
+        temp_str, hum_str = parts[0], parts[1]
         temp_stats = _parse_stats_value(temp_str)
         converted_temp = tuple(
             _temp_to_mk(stat) if stat is not None else None for stat in temp_stats
