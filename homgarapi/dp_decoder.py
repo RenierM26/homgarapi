@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
-from .constants import PRODUCT_MODEL_SPECS
+from .dp_spec_builder import get_model_dp_specs
 
 
 @dataclass(frozen=True)
@@ -17,10 +18,12 @@ class DecodedStatus:
     raw_items: list[tuple[int, bytes]]
 
 
-_DP_SPECS_BY_MODEL: dict[int, dict[int, Mapping[str, Any]]] = {
-    model_code: {dp_code: dict(spec) for dp_code, spec in specs.items()}
-    for model_code, specs in PRODUCT_MODEL_SPECS.items()
-}
+@lru_cache(maxsize=64)
+def _get_dp_specs_by_model(model_code: int) -> dict[int, Mapping[str, Any]]:
+    """Return datapoint specifications for the provided model code."""
+    raw_specs = get_model_dp_specs(model_code)
+    return {dp_code: dict(spec) for dp_code, spec in raw_specs.items()}
+
 _DP_OVERRIDES: dict[int, dict[int, str]] = {
     87: {
         4: "STA_HOUR_RAIN",
@@ -122,7 +125,7 @@ def decode_status_payload(
     """Decode a HomGar raw status payload."""
     data, z3 = _strip_prefix(value)
     items = _iter_tlv_items(data, z3)
-    specs_map = _DP_SPECS_BY_MODEL.get(model_code, {})
+    specs_map = _get_dp_specs_by_model(model_code)
 
     decoded: dict[str, Any] = {}
 

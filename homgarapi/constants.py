@@ -1,4 +1,4 @@
-"""Static data used by the HomGar API client."""
+"""Static datapoint definitions for supported HomGar devices."""
 
 from __future__ import annotations
 
@@ -64,6 +64,22 @@ PRODUCT_MODEL_SPECS: Mapping[int, Mapping[int, Mapping[str, Any]]] = {
         31: {"identity": "STA_BAT", "dataType": 1, "dataTypeSub": 1, "length": 1, "decimal": None},
         33: {"identity": "MAX_TEM", "dataType": 1, "dataTypeSub": 4, "length": 4, "decimal": None},
     },
+    277: {
+        32: {"identity": "STA_RSSI", "dataType": 1, "dataTypeSub": 1, "length": 1, "decimal": None},
+        31: {"identity": "STA_BAT", "dataType": 1, "dataTypeSub": 1, "length": 1, "decimal": None},
+        14: {"identity": "STA_VFLOW", "dataType": 1, "dataTypeSub": 4, "length": 4, "decimal": None},
+        21: {"identity": "STA_EVTIME", "dataType": 5, "dataTypeSub": 10, "length": 4, "decimal": None},
+        46: {"identity": "STA_CUR_FLOW", "dataType": 1, "dataTypeSub": 4, "length": 4, "decimal": 1},
+        19: {"identity": "STA_DURATION", "dataType": 1, "dataTypeSub": 4, "length": 4, "decimal": None},
+        15: {"identity": "STA_LASTUSAGE", "dataType": 1, "dataTypeSub": 4, "length": 4, "decimal": 1},
+        49: {"identity": "STA_LAST_DURATION", "dataType": 1, "dataTypeSub": 4, "length": 4, "decimal": None},
+        26: {"identity": "STA_TOTAL_TODAY", "dataType": 1, "dataTypeSub": 4, "length": 4, "decimal": 1},
+        20: {"identity": "STA_WATER_TOTAL", "dataType": 1, "dataTypeSub": 4, "length": 4, "decimal": 1},
+        50: {"identity": "STA_OTHER_TOTAL", "dataType": 1, "dataTypeSub": 4, "length": 4, "decimal": None},
+    },
+    264: {},
+    273: {},
+    289: {},
 }
 
 
