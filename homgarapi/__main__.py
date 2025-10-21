@@ -2,6 +2,7 @@
 
 from argparse import ArgumentParser
 from collections.abc import Mapping, MutableMapping
+import json
 import logging
 from pathlib import Path
 import pickle
@@ -73,6 +74,26 @@ def main() -> None:
         help="Optional path to write unsupported device report (YAML)",
     )
     argparse.add_argument(
+        "--dictionary-output",
+        nargs="?",
+        type=Path,
+        const=Path("dictionary.json"),
+        help=(
+            "Write the platform dictionary response to disk. Supply an optional path, "
+            "or omit to use './dictionary.json'."
+        ),
+    )
+    argparse.add_argument(
+        "--product-models-output",
+        nargs="?",
+        type=Path,
+        const=Path("product_models.json"),
+        help=(
+            "Write the product models response to disk. Supply an optional path, "
+            "or omit to use './product_models.json'."
+        ),
+    )
+    argparse.add_argument(
         "config",
         nargs="?",
         type=Path,
@@ -131,6 +152,25 @@ def main() -> None:
     try:
         api = HomgarApi(cache)
         demo(api, config_mapping)
+
+        def _write_json(output_path: Path, payload: Any, description: str) -> None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("w", encoding="utf-8") as output_handle:
+                json.dump(payload, output_handle, indent=2, sort_keys=True)
+            logger.info("Wrote %s to %s", description, output_path)
+
+        if args.dictionary_output:
+            dictionary_payload = api.get_dictionary()
+            _write_json(args.dictionary_output, dictionary_payload, "dictionary data")
+
+        if args.product_models_output:
+            product_payload = api.get_product_models()
+            _write_json(
+                args.product_models_output,
+                product_payload,
+                "product models data",
+            )
+
         unknown_devices_raw = api.get_unknown_devices()
         if unknown_devices_raw:
             unknown_devices: list[dict[str, Any]] = []
@@ -157,8 +197,8 @@ def main() -> None:
             )
     finally:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        with cache_file.open("wb") as cache_handle:
-            pickle.dump(cache, cache_handle)
+        with cache_file.open("wb") as cache_write_handle:
+            pickle.dump(cache, cache_write_handle)
 
 
 if __name__ == "__main__":

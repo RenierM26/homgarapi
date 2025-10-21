@@ -15,6 +15,7 @@ from typing import Any, cast
 import requests
 
 from .auth import AuthRetryManager, AuthRetryPolicy
+from .constants import build_model_list
 from .devices import MODEL_CODE_MAPPING, HomgarDevice, HomgarHome, HomgarHubDevice
 from .logutil import TRACE, get_logger
 
@@ -524,10 +525,11 @@ def load_product_models(
 ) -> Mapping[int, Mapping[str, Any]]:
     """Load product model metadata from the bundled JSON file."""
 
-    target = (
-        Path(path) if path is not None else Path(__file__).parent / "productmode.json"
-    )
-    payload = json.loads(target.read_text(encoding="utf-8"))
+    if path is not None:
+        target = Path(path)
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        models: list[Mapping[str, Any]] = payload["data"]["models"]
+        return {int(model["modelCode"]): model for model in models}
 
-    models: list[Mapping[str, Any]] = payload["data"]["models"]
+    models = build_model_list()
     return {int(model["modelCode"]): model for model in models}
